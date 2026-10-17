@@ -211,7 +211,7 @@ fn a_panel_gets_a_window_row_that_opens_into_the_view_it_sent() {
     // its script box — queues the click first instead and would letter the script from before the
     // user's paste. So the flush is driven directly, with a click and an edit the same frame collected.
     let frame = super::Pending {
-        events: vec![(PANEL.to_string(), "read".to_string(), Value::Null)],
+        events: vec![(PANEL.to_string(), "read".to_string(), "ui.click", Value::Null)],
         typing: vec![(PANEL.to_string(), "note".to_string(), json!("half-typed"))],
     };
     let ctx = h.ctx.clone();
@@ -316,22 +316,54 @@ fn panel_window_rect(ctx: &egui::Context, id: &str) -> Option<egui::Rect> {
 
 /// Draws one frame of the panel's real window, with the input egui would have received.
 fn draw_panel(ctx: &egui::Context, panel: &PanelDraw, input: egui::RawInput, opening: bool) -> Vec<egui::epaint::ClippedShape> {
+    draw_panel_pending(ctx, panel, input, opening).0
+}
+
+/// [`draw_panel`], and the interactions the frame collected.
+fn draw_panel_pending(
+    ctx: &egui::Context,
+    panel: &PanelDraw,
+    input: egui::RawInput,
+    opening: bool,
+) -> (Vec<egui::epaint::ClippedShape>, Pending) {
+    let mut pending = Pending::default();
     let mut out = ctx.run_ui(input, |root| {
         let ctx = root.ctx().clone();
         let t = Tokens::get(&ctx);
-        let mut pending = Pending::default();
         let _ = super::window(&ctx, &t, panel, 0, canvas(), &mut pending, opening);
     });
     out.textures_delta.clear();
-    out.shapes
+    (out.shapes, pending)
+}
+
+/// The painted text shape whose text contains `needle`.
+fn painted_text<'a>(shapes: &'a [egui::epaint::ClippedShape], needle: &str) -> Option<&'a egui::epaint::TextShape> {
+    shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text.contains(needle) => Some(text),
+        _ => None,
+    })
 }
 
 /// Where a piece of painted text starts, if it was painted at all.
 fn painted_y(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<f32> {
-    shapes.iter().find_map(|shape| match &shape.shape {
-        egui::Shape::Text(text) if text.galley.job.text.contains(needle) => Some(text.pos.y),
-        _ => None,
-    })
+    painted_text(shapes, needle).map(|text| text.pos.y)
+}
+
+/// Clicks `at` over three frames and answers with the interactions the release collected.
+fn click_at(ctx: &egui::Context, panel: &PanelDraw, at: egui::Pos2) -> Pending {
+    let mut collected = Pending::default();
+    for pressed in [None, Some(true), Some(false)] {
+        let mut input = egui::RawInput { screen_rect: Some(canvas()), ..Default::default() };
+        input.events.push(match pressed {
+            None => egui::Event::PointerMoved(at),
+            Some(pressed) => egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() },
+        });
+        let (_, pending) = draw_panel_pending(ctx, panel, input, false);
+        if pressed == Some(false) {
+            collected = pending;
+        }
+    }
+    collected
 }
 
 /// A page of `rows` plain labels: tall enough to scroll, with nothing in it that scrolls on its own.
@@ -443,7 +475,7 @@ fn body_extent(view: Value, width: f32) -> f32 {
                 ui.set_min_width(width);
                 ui.set_max_width(width);
                 let mut pending = Pending::default();
-                body(ui, &t, &panel, view, &mut pending);
+                body(ui, &t, &panel, view, &mut pending, Flow::Scrolling, None);
                 extent = ui.min_rect().width();
             });
         });
@@ -601,4 +633,164 @@ fn a_row_wraps_its_buttons_in_a_narrow_panel() {
     // The font line below the row wraps at the panel, not at the width the overflowing row forced.
     let line = font_line.expect("the font line is drawn");
     assert!(line.galley.job.wrap.max_width <= window.width(), "the font line is given {} px in a {}-px window", line.galley.job.wrap.max_width, window.width());
+}
+
+#[test]
+fn a_list_row_reports_its_index_and_marks_the_current_one() {
+    // The style list of a lettering panel: numbered rows, the current line highlighted, and a click
+    // telling the plug-in which row was picked. A row is one line, so the click is unambiguous.
+    let mut panel = test_panel(
+        "test.list",
+        json!({"type":"column","children":[
+            {"type":"list","id":"lines","selected":1,"numbered":true,"rows":[
+                {"text":"First line"},{"text":"Second line"},{"text":"Third line"}]}]}),
+    );
+    panel.min_width = 250;
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    let mut shapes = Vec::new();
+    for _ in 0..6 {
+        shapes = draw_panel(&ctx, &panel, egui::RawInput { screen_rect: Some(canvas()), ..Default::default() }, true);
+    }
+    let window = panel_window_rect(&ctx, "test.list").expect("the panel's window is drawn");
+    assert!(window.width() < 320.0, "the list stayed inside the panel: {window:?}");
+    // Every row and every gutter number is drawn.
+    for text in ["1", "2", "3", "First line", "Second line", "Third line"] {
+        assert!(painted_y(&shapes, text).is_some(), "{text:?} was not drawn");
+    }
+    // The selected row is the current one: its text takes the accent, the rows around it do not.
+    let colour_of = |needle: &str| painted_text(&shapes, needle).and_then(|t| t.galley.job.sections.first().map(|s| s.format.color));
+    let t = Tokens::get(&ctx);
+    assert_eq!(colour_of("Second line"), Some(t.accent_text));
+    assert_eq!(colour_of("First line"), Some(t.text));
+
+    // A click on the third row sends its index to the plug-in.
+    let third = painted_text(&shapes, "Third line").expect("the third row is drawn");
+    let at = pos2(window.left() + 40.0, third.pos.y + third.galley.size().y / 2.0);
+    let events = click_at(&ctx, &panel, at);
+    assert!(
+        events.events.iter().any(|(panel, widget, kind, value)| panel == "test.list" && widget == "lines" && *kind == "ui.click" && value == &json!(2)),
+        "a click on the third row reports index 2: {:?}",
+        events.events
+    );
+}
+
+#[test]
+fn scroll_panes_share_the_panel_and_keep_their_footers_visible() {
+    // The lettering layout the widgets exist for: a script pane above a styles pane, each scrolling
+    // on its own and each with a pinned footer (the counter and the navigation) that stays put.
+    let script: Vec<Value> = (0..80).map(|i| json!({"type":"label","text":format!("Script {i}")})).collect();
+    let styles: Vec<Value> = (0..40).map(|i| json!({"type":"label","text":format!("Style {i}")})).collect();
+    let mut panel = test_panel(
+        "test.panes",
+        json!({"type":"column","children":[
+            {"type":"scroll","id":"script","weight":2,"children":script,"footer":[
+                {"type":"label","text":"Pinned counter"}]},
+            {"type":"scroll","id":"styles","weight":1,"children":styles,"footer":[
+                {"type":"label","text":"Pinned styles"}]}]}),
+    );
+    panel.min_width = 250;
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    let mut shapes = Vec::new();
+    for _ in 0..6 {
+        shapes = draw_panel(&ctx, &panel, egui::RawInput { screen_rect: Some(canvas()), ..Default::default() }, true);
+    }
+    let window = panel_window_rect(&ctx, "test.panes").expect("the panel's window is drawn");
+    assert!(window.width() < 320.0, "the panes stayed inside the panel: {window:?}");
+    // Both panes start at their own first row: the script's 80 lines did not push the styles out.
+    let first_script = painted_y(&shapes, "Script 0").expect("the script pane shows its first line");
+    let first_style = painted_y(&shapes, "Style 0").expect("the styles pane shows its own first row");
+    assert!(first_style > first_script, "the styles pane is below the script pane: {first_style} vs {first_script}");
+    // Both pinned footers are inside the window, the second one at the bottom.
+    let counter = painted_y(&shapes, "Pinned counter").expect("the script pane's footer is drawn");
+    let styles_footer = painted_y(&shapes, "Pinned styles").expect("the styles pane's footer is drawn");
+    for y in [counter, styles_footer] {
+        assert!(y > window.top() + 40.0 && y < window.bottom(), "a footer is inside the window: {y} in {window:?}");
+    }
+    assert!(styles_footer > counter, "each footer is at the bottom of its own pane: {styles_footer} vs {counter}");
+
+    // The wheel over the script pane scrolls that pane, and only that one.
+    let at = pos2(window.center().x, first_script + 10.0);
+    for _ in 0..6 {
+        let mut input = egui::RawInput { screen_rect: Some(canvas()), ..Default::default() };
+        input.events.push(egui::Event::PointerMoved(at));
+        input.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -240.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        });
+        shapes = draw_panel(&ctx, &panel, input, false);
+    }
+    assert!(painted_y(&shapes, "Script 0").is_none_or(|y| y < first_script - 20.0), "the script pane scrolled: {:?}", painted_y(&shapes, "Script 0"));
+    assert!(painted_y(&shapes, "Style 0").is_some(), "the styles pane did not move with it");
+    assert!(painted_y(&shapes, "Pinned counter").is_some(), "and the pinned footer stays");
+}
+
+#[test]
+fn a_label_named_font_comes_from_the_host_and_an_unknown_one_falls_back() {
+    // A plug-in never touches a font file: it names a family and the host resolves it in its own
+    // database. An installed family is used for the label; an unknown one is the panel font, not a
+    // crash and not a stopped panel. The whole tree is still drawn while the font is being
+    // registered (egui takes it from the next pass).
+    let panel = test_panel(
+        "test.font",
+        json!({"type":"column","children":[
+            {"type":"label","text":"Known","font":"Inter"},
+            {"type":"label","text":"Unknown","font":"No Such Family Anywhere"},
+            {"type":"list","id":"styles","rows":[
+                {"text":"Comic","font":"No Such Family Anywhere","color":"#ff8800"}]}]}),
+    );
+    // The host resolves families in its shared font database, which a desktop build scans in the
+    // background on first use. Wait for that scan (bounded) so the bundled `Inter` is there; the
+    // panel itself never waits for it — it draws in its panel font and asks for a repaint.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while photocraft_text::try_shared().is_none() {
+        assert!(std::time::Instant::now() < deadline, "the system font scan never finished");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    let mut shapes = Vec::new();
+    for _ in 0..4 {
+        shapes = draw_panel(&ctx, &panel, egui::RawInput { screen_rect: Some(canvas()), ..Default::default() }, true);
+    }
+    let family = |needle: &str| painted_text(&shapes, needle).and_then(|t| t.galley.job.sections.first().map(|s| s.format.font_id.family.clone()));
+    assert_eq!(family("Known"), Some(egui::FontFamily::Name("plugin:Inter".into())), "the host resolved the family it was given");
+    assert_eq!(family("Unknown"), Some(egui::FontFamily::Proportional), "an unknown family is the panel font");
+    // A row's colour is used as given, and a row font that does not exist falls back the same way.
+    let comic = painted_text(&shapes, "Comic").expect("the row is drawn");
+    assert_eq!(comic.galley.job.sections[0].format.color, Color32::from_rgb(0xff, 0x88, 0x00));
+}
+
+#[test]
+fn an_icon_button_draws_its_glyph_and_reports_a_click() {
+    // A row of compact icon buttons, as a lettering panel's line navigation: the glyph is what is
+    // drawn, the label is the tooltip, and a click reports the widget id like any other button.
+    let mut panel = test_panel(
+        "test.icons",
+        json!({"type":"row","children":[
+            {"type":"label","text":"Line"},
+            {"type":"button","id":"prev","label":"Previous line","icon":"◀"},
+            {"type":"button","id":"next","label":"Next line","icon":"▶"}]}),
+    );
+    panel.min_width = 250;
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    let mut shapes = Vec::new();
+    for _ in 0..6 {
+        shapes = draw_panel(&ctx, &panel, egui::RawInput { screen_rect: Some(canvas()), ..Default::default() }, true);
+    }
+    for glyph in ["◀", "▶"] {
+        assert!(painted_y(&shapes, glyph).is_some(), "{glyph:?} is drawn as an icon");
+    }
+    let next = painted_text(&shapes, "▶").expect("the next button is drawn");
+    let at = next.pos + next.galley.size() / 2.0;
+    let events = click_at(&ctx, &panel, at);
+    assert!(
+        events.events.iter().any(|(panel, widget, kind, value)| panel == "test.icons" && widget == "next" && *kind == "ui.click" && value.is_null()),
+        "the icon button sent its click: {:?}",
+        events.events
+    );
 }

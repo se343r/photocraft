@@ -12,10 +12,12 @@
 //! Nothing in `theme::Tokens` is reachable from a plug-in — it names widgets and levels, never
 //! colours or sizes — so a panel is on-theme in light and dark, in every theme, for free.
 
-use egui::{FontId, RichText, Sense, Stroke, pos2, vec2};
+use std::sync::Arc;
+
+use egui::{Align2, Color32, FontData, FontFamily, FontId, RichText, Sense, Stroke, pos2, vec2};
 use photocraft_engine::plugin_panel_cmds::{PanelDraw, Progress};
 use photocraft_plugins::ops::NoticeLevel;
-use photocraft_plugins::view::{Level, Widget};
+use photocraft_plugins::view::{Level, ListRow, Widget};
 use serde_json::{Map, Value, json};
 
 use crate::PhotocraftApp;
@@ -164,9 +166,7 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
         send_event(app, &id, "cancel", None, Value::Null);
     }
     flush_typing(app, ctx, &pending);
-    for (panel, widget, value) in pending.events {
-        // A `null` value is a click; anything else is the value a field committed with `ui.change`.
-        let kind = if value.is_null() { "ui.click" } else { "ui.change" };
+    for (panel, widget, kind, value) in pending.events {
         send_event(app, &panel, kind, Some(&widget), value);
     }
 }
@@ -231,29 +231,36 @@ fn window(ctx: &egui::Context, t: &Tokens, panel: &PanelDraw, index: usize, canv
                             .show(ui, |ui| footer(ui, t, panel, &mut asked));
                     }
                     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-                        if opening {
-                            // The same id `ScrollArea::id_salt` derives (an `IdSalt` is hashed once
-                            // more when it becomes an id), so this is the body's saved offset.
-                            let salt = egui::IdSalt::new(("plugin-panel-body", panel.id.as_str()));
-                            let body = ui.make_persistent_id(salt);
-                            egui::scroll_area::State::default().store(ui.ctx(), body);
-                        }
-                        egui::ScrollArea::vertical()
-                            .id_salt(("plugin-panel-body", panel.id.as_str()))
-                            .max_height(ui.available_height())
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                match &panel.view {
-                                    // Everything the plug-in sent is drawn inside the panel's own width (see
-                                    // `at_panel_width`): a window is sized from its content every frame, so a
-                                    // body that sticks out makes it wider, and wider again the next frame.
-                                    Some(view) => at_panel_width(ui, |ui| body(ui, t, panel, view, pending)),
-                                    // A panel that has not answered `init` yet, or answered with no view.
-                                    None => {
-                                        ui.label(RichText::new(tl!("This plug-in has not drawn anything yet.")).color(t.text_faint).size(11.5));
-                                    }
+                        // A view with `scroll` panes owns the panel's height: inside the body's own
+                        // scroll area it would be handed an endless one, and the panes could never
+                        // share it. So such a view is drawn straight into the panel, with the real
+                        // height as its budget; everything else keeps the scrolling body it has
+                        // always had.
+                        let pane_mode = panel.view.as_ref().is_some_and(photocraft_plugins::view::has_scroll);
+                        match &panel.view {
+                            // Everything the plug-in sent is drawn inside the panel's own width (see
+                            // `at_panel_width`): a window is sized from its content every frame, so a
+                            // body that sticks out makes it wider, and wider again the next frame.
+                            Some(view) if pane_mode => at_panel_width(ui, |ui| body(ui, t, panel, view, pending, Flow::Panes, None)),
+                            Some(view) => {
+                                if opening {
+                                    // The same id `ScrollArea::id_salt` derives (an `IdSalt` is hashed once
+                                    // more when it becomes an id), so this is the body's saved offset.
+                                    let salt = egui::IdSalt::new(("plugin-panel-body", panel.id.as_str()));
+                                    let body = ui.make_persistent_id(salt);
+                                    egui::scroll_area::State::default().store(ui.ctx(), body);
                                 }
-                            });
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("plugin-panel-body", panel.id.as_str()))
+                                    .max_height(ui.available_height())
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| at_panel_width(ui, |ui| body(ui, t, panel, view, pending, Flow::Scrolling, None)));
+                            }
+                            // A panel that has not answered `init` yet, or answered with no view.
+                            None => {
+                                ui.label(RichText::new(tl!("This plug-in has not drawn anything yet.")).color(t.text_faint).size(11.5));
+                            }
+                        }
                     });
                 }
             }
@@ -287,9 +294,12 @@ fn at_panel_width(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 /// What one frame of drawing collected.
 #[derive(Default)]
 struct Pending {
-    /// Interactions to send, in the order the widgets were drawn: `(panel, widget, value)`, where a
-    /// `null` value is a click and anything else is the value a field committed.
-    events: Vec<(String, String, Value)>,
+    /// Interactions to send, in the order the widgets were drawn: `(panel, widget, event, value)`.
+    ///
+    /// The event is explicit rather than derived from the value: a button's click carries `null`,
+    /// and a `list` row's click carries the row index — both are `ui.click`, while a field that
+    /// committed a value is `ui.change`.
+    events: Vec<(String, String, &'static str, Value)>,
     /// Text fields that were being typed into when the frame ended: `(panel, widget, buffer)`.
     ///
     /// egui takes the focus from a text field when the user clicks somewhere else, but a field only
@@ -305,7 +315,7 @@ struct Pending {
 /// loss is not reported a second time next frame: the plug-in answers the change by echoing the value
 /// back (a new view or `ui.set`), which is what the ABI already asks of it.
 fn flush_typing(app: &mut PhotocraftApp, ctx: &egui::Context, pending: &Pending) {
-    let clicks: Vec<&str> = pending.events.iter().filter(|(_, _, v)| v.is_null()).map(|(panel, ..)| panel.as_str()).collect();
+    let clicks: Vec<&str> = pending.events.iter().filter(|(_, _, kind, _)| *kind == "ui.click").map(|(panel, ..)| panel.as_str()).collect();
     if clicks.is_empty() {
         return;
     }
@@ -314,7 +324,7 @@ fn flush_typing(app: &mut PhotocraftApp, ctx: &egui::Context, pending: &Pending)
             continue;
         }
         // Already committed this frame (the field lost the focus before the button was drawn).
-        if pending.events.iter().any(|(p, w, v)| p == panel && w == widget && !v.is_null()) {
+        if pending.events.iter().any(|(p, w, kind, _)| p == panel && w == widget && *kind == "ui.change") {
             continue;
         }
         send_event(app, panel, "ui.change", Some(widget), typed.clone());
@@ -402,21 +412,69 @@ fn progress_row(ui: &mut egui::Ui, t: &Tokens, progress: &Progress, asked: &mut 
 struct PanelButton<'a> {
     label: &'a str,
     primary: bool,
+    /// A glyph drawn instead of the label, as a compact square button. The label is then the
+    /// tooltip and the accessible name.
+    icon: Option<&'a str>,
 }
 
 impl egui::Widget for PanelButton<'_> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        if self.primary {
-            crate::widgets::primary_button(ui, self.label, 0.0)
-        } else {
-            crate::widgets::secondary_button(ui, self.label, 0.0)
+        let Some(icon) = self.icon.filter(|i| !i.is_empty()) else {
+            return if self.primary {
+                crate::widgets::primary_button(ui, self.label, 0.0)
+            } else {
+                crate::widgets::secondary_button(ui, self.label, 0.0)
+            };
+        };
+        // A compact square with the glyph centred: the icon buttons of a lettering panel's rows
+        // (previous/next line, delete, a folder) sit beside a number and must not cost a word's
+        // width. Drawn through `allocate_exact_size`, so a `row` decides whether it fits.
+        let t = Tokens::get(ui.ctx());
+        let size = 22.0;
+        let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+        let fill = if self.primary { t.accent_soft } else { Color32::TRANSPARENT };
+        if fill != Color32::TRANSPARENT || resp.hovered() {
+            ui.painter().rect_filled(rect, t.radius_sm, if resp.hovered() { t.hover } else { fill });
         }
+        let tint = if resp.hovered() { t.text } else if self.primary { t.accent_text } else { t.icon };
+        let galley = ui.painter().layout_no_wrap(icon.to_string(), FontId::proportional(13.0), tint);
+        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, tint);
+        let name = if self.label.is_empty() { icon } else { self.label };
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), name));
+        if self.label.is_empty() { resp } else { resp.on_hover_text(self.label) }
     }
 }
 
-/// Draws one widget tree, collecting every interaction into `pending` — `(panel, widget, value)`,
-/// where a `null` value is a click and anything else is a committed value.
-fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pending: &mut Pending) {
+/// How a view is laid out in the panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// The ordinary body: a column of widgets inside the panel's own scrolling body.
+    Scrolling,
+    /// A view with `scroll` panes: the panel's free height is the budget, and a `column` shares it
+    /// among its height-less panes by weight (see [`Widget::Scroll`]).
+    Panes,
+}
+
+/// The least height a `scroll` pane is given, so a crowded panel still shows a row in each pane.
+const MIN_PANE: f32 = 48.0;
+/// The height a `scroll` pane gets when nothing gives it one (a pane in a `row`, say).
+const DEFAULT_PANE: f32 = 240.0;
+/// Most font families one session registers for panel labels.
+///
+/// egui cannot unregister a font, so a style library with a font per style would otherwise keep
+/// every one of those files in the process for its lifetime. Past the cap the panel font is used:
+/// the panel still draws, just not in each style's own face.
+const MAX_PLUGIN_FONTS: usize = 24;
+/// Most face data (font files) one session registers for panel labels.
+const MAX_PLUGIN_FONT_BYTES: usize = 48 * 1024 * 1024;
+/// The size a panel label, and a style name in its own font, is drawn at.
+const PANEL_TEXT: f32 = 12.0;
+
+/// Draws one widget tree, collecting every interaction into `pending`.
+///
+/// `pane_height` is only consulted by a `scroll`: when a `column` is sharing the panel's free
+/// height (`Flow::Panes`) it hands each of its height-less panes its share through here.
+fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pending: &mut Pending, flow: Flow, pane_height: Option<f32>) {
     // The room left on this line, not `ui.available_width()`: inside a `row` — a *wrapping* layout,
     // where a widget is allowed to take a whole line of its own — egui answers that with the whole
     // row's width. A dropdown or a field drawn after a label was therefore handed the label's width
@@ -427,15 +485,29 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
     match widget {
         Widget::Column { children } => {
             ui.vertical(|ui| {
+                // In a pane view the column shares the panel's free height among its height-less
+                // panes. Each share comes from what is left at that pane, so the widgets above it
+                // (a page switcher, a preview) are paid for first, and is proportional to the
+                // weights left, so two panes keep their ratio. Anything that must stay visible
+                // under a pane belongs in that pane's `footer`.
+                let mut weights_left: u32 =
+                    if flow == Flow::Panes { children.iter().filter_map(pane_weight).map(u32::from).sum() } else { 0 };
                 for child in children {
-                    body(ui, t, panel, child, pending);
+                    match (flow == Flow::Panes).then(|| pane_weight(child)).flatten() {
+                        Some(weight) => {
+                            let share = ui.available_height().max(MIN_PANE) * f32::from(weight) / weights_left.max(1) as f32;
+                            weights_left = weights_left.saturating_sub(u32::from(weight));
+                            body(ui, t, panel, child, pending, flow, Some(share));
+                        }
+                        None => body(ui, t, panel, child, pending, flow, None),
+                    }
                 }
             });
         }
         Widget::Row { children } => {
             ui.horizontal_wrapped(|ui| {
                 for child in children {
-                    body(ui, t, panel, child, pending);
+                    body(ui, t, panel, child, pending, flow, None);
                 }
             });
         }
@@ -447,19 +519,27 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
                 .default_open(!collapsed)
                 .show(ui, |ui| {
                     for child in children {
-                        body(ui, t, panel, child, pending);
+                        // Scrolling, not the caller's flow: a pane inside a section is sized on its
+                        // own (or gets `DEFAULT_PANE`), not out of the column's budget.
+                        body(ui, t, panel, child, pending, Flow::Scrolling, None);
                     }
                 });
         }
-        Widget::Label { text, level } => {
-            let colour = match level {
+        Widget::Label { text, level, color, font } => {
+            // A named colour wins over the level's theme colour; a family is resolved by the host,
+            // and an unknown one is the panel font, not an error.
+            let colour = color.as_deref().and_then(plugin_color).unwrap_or(match level {
                 Some(Level::Muted) => t.text_faint,
                 Some(Level::Warning) => t.warning,
                 Some(Level::Error) => t.danger,
                 Some(Level::Info) | None => t.text,
+            });
+            let rich = match font.as_deref().and_then(|family| plugin_font(ui.ctx(), family)) {
+                Some(family) => RichText::new(text).color(colour).font(FontId::new(PANEL_TEXT, family)),
+                None => RichText::new(text).color(colour).size(PANEL_TEXT),
             };
             // Labels wrap: a script line or a refusal can be long, and a panel is narrow.
-            ui.add(egui::Label::new(RichText::new(text).color(colour).size(12.0)).wrap());
+            ui.add(egui::Label::new(rich).wrap());
         }
         Widget::Separator => crate::widgets::hairline(ui),
         Widget::Text { id, value, placeholder, multiline, max_length } => {
@@ -478,7 +558,7 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
                 crate::widgets::text_field_ex(ui, key, &mut buf.1, &hint, width, false, *max_length)
             };
             if resp.lost_focus() && buf.1 != shown {
-                pending.events.push((panel.id.clone(), id.clone(), Value::String(buf.1.clone())));
+                pending.events.push((panel.id.clone(), id.clone(), "ui.change", Value::String(buf.1.clone())));
             }
             // Still in the field with an edit the plug-in has not heard about: a click elsewhere in
             // the panel ends the edit, so it has to be delivered before that click (see `Pending`).
@@ -504,7 +584,7 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
                 }
                 let v = f64::from(v);
                 if v != shown {
-                    pending.events.push((panel.id.clone(), id.clone(), json!(v)));
+                    pending.events.push((panel.id.clone(), id.clone(), "ui.change", json!(v)));
                 }
             }
         }
@@ -512,7 +592,7 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
             let shown = panel.values.get(id).and_then(Value::as_bool).unwrap_or(*value);
             let mut on = shown;
             if crate::widgets::toggle(ui, &mut on, label).changed() && on != shown {
-                pending.events.push((panel.id.clone(), id.clone(), json!(on)));
+                pending.events.push((panel.id.clone(), id.clone(), "ui.change", json!(on)));
             }
         }
         Widget::Choice { id, value, options } => {
@@ -522,10 +602,10 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
             let list: Vec<(String, &str)> = options.iter().map(|o| (o.value.clone(), o.label.as_str())).collect();
             let salt = format!("plugin-panel-choice-{}-{id}", panel.id);
             if crate::widgets::dropdown_literal(ui, &salt, &mut current, &list, width) && current != shown {
-                pending.events.push((panel.id.clone(), id.clone(), Value::String(current)));
+                pending.events.push((panel.id.clone(), id.clone(), "ui.change", Value::String(current)));
             }
         }
-        Widget::Button { id, label, primary, enabled } => {
+        Widget::Button { id, label, primary, enabled, icon } => {
             let on = enabled.unwrap_or(true);
             // A widget rather than `add_enabled_ui`: that builds a child `Ui`, and a child is placed
             // at the cursor and then advanced past by `advance_cursor_after_rect` without the
@@ -535,13 +615,20 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
             // then grew, widened the column's `max_rect`, so the labels below it stopped wrapping
             // too. `Ui::add_enabled` disables the same `Ui` and draws the widget through the row's
             // own allocation, so a disabled button wraps like an enabled one.
-            let resp = ui.add_enabled(on, PanelButton { label, primary: *primary });
+            let resp = ui.add_enabled(on, PanelButton { label, primary: *primary, icon: icon.as_deref() });
             if resp.clicked() {
-                pending.events.push((panel.id.clone(), id.clone(), Value::Null));
+                pending.events.push((panel.id.clone(), id.clone(), "ui.click", Value::Null));
             }
             if !on {
                 resp.on_hover_text(tl!("The plug-in has disabled this."));
             }
+        }
+        Widget::List { id, selected, numbered, rows } => {
+            list(ui, &Paint { t, panel }, id, *selected, *numbered, rows, pending);
+        }
+        Widget::Scroll { id, height, children, footer, .. } => {
+            let height = height.map(|h| h as f32).or(pane_height).unwrap_or(DEFAULT_PANE);
+            pane(ui, &Paint { t, panel }, id, height, children, footer, pending);
         }
         Widget::Progress { fraction } => {
             // `null` is an indeterminate bar: a plug-in that does not know how far along it is.
@@ -554,6 +641,199 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
                 .on_hover_text(tl!("This host does not capture documents for plug-ins yet, so a panel has no images."));
         }
     }
+}
+
+/// A pane's weight, if this widget is a height-less `scroll`: the weight a `column` in pane mode
+/// shares the panel's free height by.
+fn pane_weight(widget: &Widget) -> Option<u8> {
+    match widget {
+        Widget::Scroll { height: None, weight, .. } => Some(*weight),
+        _ => None,
+    }
+}
+
+/// `#rrggbb` from a plug-in, as an egui colour.
+///
+/// Validation has already refused anything else, so this is only the conversion; an impossible
+/// string is `None` (the theme colour is used) rather than a panic.
+fn plugin_color(hex: &str) -> Option<Color32> {
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    Some(Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+}
+
+/// What this session has already asked egui for, so a name is resolved once and a missing family
+/// is not looked up every frame.
+#[derive(Clone, Default)]
+struct PluginFonts {
+    /// Families already resolved (registered, or found not to be installed).
+    tried: std::collections::HashSet<String>,
+    /// Families actually registered.
+    registered: usize,
+    /// Face bytes actually handed to egui.
+    bytes: usize,
+}
+
+fn fonts_id() -> egui::Id {
+    egui::Id::new("plugin-panel-fonts")
+}
+
+/// The host's own family for a family a plug-in named, registered on first use.
+///
+/// A plug-in never sees a font file: it names a family, and the host resolves it in its own font
+/// database and registers it under a namespaced family (`plugin:<family>`, so a plug-in can never
+/// shadow the application's own `medium`/`semibold`). egui takes a new font from the *next* pass,
+/// and asking for a family that is not bound panics, so the frame a name is first seen draws in
+/// the panel font and asks for a repaint; from then on the named family is used.
+///
+/// Everything here is bounded and falls back silently: an unknown family, a face too large to keep
+/// in the process, more families than [`MAX_PLUGIN_FONTS`] — the panel still draws its labels, just
+/// in the panel font. A style library must never be able to stop a panel drawing.
+fn plugin_font(ctx: &egui::Context, family: &str) -> Option<FontFamily> {
+    let key: Arc<str> = format!("plugin:{family}").into();
+    let font = FontFamily::Name(key.clone());
+    // Bound already: egui has applied the registration.
+    if ctx.fonts(|f| f.families().contains(&font)) {
+        return Some(font);
+    }
+    let mut registry: PluginFonts = ctx.data(|d| d.get_temp(fonts_id())).unwrap_or_default();
+    if registry.tried.contains(family) {
+        return None;
+    }
+    if registry.registered >= MAX_PLUGIN_FONTS || registry.bytes >= MAX_PLUGIN_FONT_BYTES {
+        // Out of budget: remember nothing, so a family that shows up later is not looked up again
+        // and again, but also do not record it as tried — the next session (after a restart) may
+        // have room.
+        registry.tried.insert(family.to_string());
+        ctx.data_mut(|d| d.insert_temp(fonts_id(), registry));
+        return None;
+    }
+    let Some(engine) = photocraft_text::try_shared() else {
+        // The system font scan is still running: the answer is not known yet, so ask again shortly.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        return None;
+    };
+    let face = engine.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fonts.ui_face(family);
+    let Some((bytes, index)) = face else {
+        registry.tried.insert(family.to_string());
+        ctx.data_mut(|d| d.insert_temp(fonts_id(), registry));
+        return None;
+    };
+    let size = bytes.len();
+    if registry.bytes.saturating_add(size) > MAX_PLUGIN_FONT_BYTES {
+        registry.tried.insert(family.to_string());
+        ctx.data_mut(|d| d.insert_temp(fonts_id(), registry));
+        return None;
+    }
+    registry.tried.insert(family.to_string());
+    registry.registered += 1;
+    registry.bytes = registry.bytes.saturating_add(size);
+    ctx.data_mut(|d| d.insert_temp(fonts_id(), registry));
+    let mut data = FontData::from_owned(bytes);
+    data.index = index;
+    crate::theme::size_ui_font(ctx, &key, &mut data);
+    ctx.add_font(egui::epaint::text::FontInsert {
+        name: key.to_string(),
+        data,
+        families: vec![egui::epaint::text::InsertFontFamily { family: font, priority: egui::epaint::text::FontPriority::Highest }],
+    });
+    ctx.request_repaint(); // the family is bound from the next pass
+    None
+}
+
+/// What a widget needs that does not change down the tree.
+struct Paint<'a> {
+    t: &'a Tokens,
+    panel: &'a PanelDraw,
+}
+
+/// A `list`: one selectable row per line, with an optional line-number gutter.
+///
+/// A click sends `ui.click` with the row's index, so a plug-in learns which line was picked
+/// without matching text. Rows are a single line each, elided with `…` at the pane's edge: a
+/// wrapped row would make the list's height depend on how a style name happens to break.
+fn list(ui: &mut egui::Ui, paint: &Paint<'_>, id: &str, selected: Option<usize>, numbered: bool, rows: &[ListRow], pending: &mut Pending) {
+    let t = paint.t;
+    let width = ui.available_rect_before_wrap().width().max(16.0);
+    const ROW_HEIGHT: f32 = 18.0;
+    let digits = rows.len().max(1).to_string().len();
+    let gutter = if numbered { digits as f32 * 7.0 + 8.0 } else { 0.0 };
+    for (index, row) in rows.iter().enumerate() {
+        let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::click());
+        let is_selected = selected == Some(index);
+        let painter = ui.painter();
+        if is_selected {
+            painter.rect_filled(rect, t.radius_sm, t.accent_soft);
+            // A 2 px bar on the current row: the highlight has to read at a glance in both themes.
+            painter.rect_filled(egui::Rect::from_min_size(rect.min, vec2(2.0, rect.height())), t.radius_sm, t.accent);
+        } else if resp.hovered() {
+            painter.rect_filled(rect, t.radius_sm, t.hover);
+        }
+        if numbered {
+            let number = format!("{:>width$}", index + 1, width = digits);
+            painter.text(pos2(rect.left() + gutter - 6.0, rect.center().y), Align2::RIGHT_CENTER, number, FontId::proportional(10.5), t.text_faint);
+        }
+        let font = row.font.as_deref().and_then(|family| plugin_font(ui.ctx(), family));
+        let font_id = font.map_or_else(|| FontId::proportional(PANEL_TEXT), |family| FontId::new(PANEL_TEXT, family));
+        let colour = row.color.as_deref().and_then(plugin_color).unwrap_or(if is_selected { t.accent_text } else { t.text });
+        let room = (rect.right() - 6.0 - (rect.left() + 6.0 + gutter)).max(8.0);
+        let mut job = egui::text::LayoutJob::single_section(row.text.clone(), egui::TextFormat { font_id, color: colour, ..Default::default() });
+        job.wrap.max_width = room;
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+        let at = pos2(rect.left() + 6.0 + gutter, rect.center().y - galley.size().y / 2.0);
+        painter.galley(at, galley, colour);
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), is_selected, &row.text));
+        if resp.clicked() {
+            pending.events.push((paint.panel.id.clone(), id.to_string(), "ui.click", json!(index)));
+        }
+    }
+}
+
+/// One `scroll` pane: its content scrolls on its own, its `footer` is pinned under it, and neither
+/// is allowed past the panel's width.
+fn pane(ui: &mut egui::Ui, paint: &Paint<'_>, id: &str, height: f32, children: &[Widget], footer: &[Widget], pending: &mut Pending) {
+    let (t, panel) = (paint.t, paint.panel);
+    let available = ui.available_rect_before_wrap();
+    let width = available.width().max(16.0);
+    // Never taller than the room there is (or than the ABI allows): a pane that asked for more
+    // would push its own footer off the window.
+    let height = height.clamp(MIN_PANE, photocraft_plugins::view::MAX_SCROLL_HEIGHT as f32).min(ui.available_height().max(MIN_PANE));
+    let rect = egui::Rect::from_min_size(available.min, vec2(width, height));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    // The pane is clipped to its own width and height, like the body is to the panel's width.
+    let clip = child.clip_rect();
+    child.set_clip_rect(clip.intersect(egui::Rect::from_min_max(rect.min, rect.max)));
+    if !footer.is_empty() {
+        egui::Panel::bottom(egui::Id::new(("plugin-panel-pane-footer", panel.id.as_str(), id)))
+            .frame(egui::Frame::NONE)
+            .show(&mut child, |ui| {
+                at_panel_width(ui, |ui| {
+                    for widget in footer {
+                        body(ui, t, panel, widget, pending, Flow::Scrolling, None);
+                    }
+                });
+            });
+    }
+    egui::CentralPanel::default().frame(egui::Frame::NONE).show(&mut child, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt(("plugin-panel-scroll", panel.id.as_str(), id))
+            .max_height(ui.available_height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                at_panel_width(ui, |ui| {
+                    for widget in children {
+                        body(ui, t, panel, widget, pending, Flow::Scrolling, None);
+                    }
+                });
+            });
+    });
+    ui.allocate_rect(rect, Sense::hover());
 }
 
 /// The script box: [`crate::widgets::text_field`]'s box, taller and top-aligned, with its own
@@ -595,7 +875,9 @@ fn send_event(app: &mut PhotocraftApp, panel: &str, kind: &str, widget: Option<&
     if let Some(widget) = widget {
         event.insert("id".into(), json!(widget));
     }
-    if kind == "ui.change" {
+    // A button's click has no value; a list row's click carries its index, and a committed field
+    // carries what it committed. The event type says which widget it was.
+    if !value.is_null() {
         event.insert("value".into(), value);
     }
     let sent = app.run("plugin.panel.event", json!({"id": panel, "event": Value::Object(event)})).map(|_| ());

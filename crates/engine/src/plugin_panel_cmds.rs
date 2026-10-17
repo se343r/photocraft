@@ -125,6 +125,11 @@ fn entropy() -> String {
 }
 
 /// The host facts an `init` carries.
+///
+/// `widgets` is the newer widget features this build draws (see
+/// [`photocraft_plugins::view::WIDGET_FEATURES`]): a panel built once for many PhotoCraft versions
+/// checks it before using a `list`, a `scroll` pane, a coloured or font-named label, or an icon
+/// button, and falls back to the plain layout when the host does not list one.
 fn host_info() -> Value {
     json!({
         "name": "PhotoCraft",
@@ -132,6 +137,7 @@ fn host_info() -> Value {
         "build": crate::build_info::short_sha(),
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        "widgets": photocraft_plugins::view::WIDGET_FEATURES,
     })
 }
 
@@ -602,7 +608,7 @@ fn event(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let values = panel.view.values.clone();
         let event = match kind {
-            "ui.click" => ops::ui_click(ctx.now, widget("ui.click")?, &values),
+            "ui.click" => ops::ui_click(ctx.now, widget("ui.click")?, event.get("value").unwrap_or(&Value::Null), &values),
             "ui.change" => ops::ui_change(ctx.now, widget("ui.change")?, event.get("value").unwrap_or(&Value::Null), &values),
             "cancel" => ops::cancel(ctx.now),
             other => return Err(bad(CMD, format!("`{other}` is not a panel event (`ui.click`, `ui.change` or `cancel`)"))),

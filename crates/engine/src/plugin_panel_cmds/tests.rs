@@ -327,6 +327,12 @@ fn a_click_reaches_the_panel_and_its_operations_are_carried_out() {
     assert_eq!(seen["id"], "other");
     assert!(seen["now"].as_u64().unwrap_or(0) > 0, "the host supplies the clock, so a panel cannot forge one");
     assert_eq!(seen["values"]["script"], "line one", "the values the host holds go with the event");
+    // A `list` row's click carries the row's index; a button's carries none (checked above by its
+    // absence), so the event keeps its old shape for widgets that have nothing to report.
+    s.execute("plugin.panel.event", json!({"id": id, "event": {"type": "ui.click", "id": "rows", "value": 2}})).unwrap();
+    let seen = last_event(&mut s, id);
+    assert_eq!(seen["id"], "rows");
+    assert_eq!(seen["value"], 2);
     // An event naming a widget the panel never declared is the panel's to judge, not the host's; an
     // event the ABI does not have is not.
     assert!(click(&mut s, id, "not-a-widget").is_ok());
@@ -698,4 +704,17 @@ fn the_example_panel_plug_in_works_end_to_end() {
     s.execute("plugin.install", json!({"data": b64(EXAMPLE)})).unwrap();
     assert_eq!(open(&mut s, id)["view"]["children"][1]["value"], "");
     cleanup(&mut s, id);
+}
+
+#[test]
+fn a_panel_is_told_which_widgets_this_host_draws() {
+    // A panel is built once and installed into whatever PhotoCraft takes it: it checks this list
+    // before using a newer widget (a list, a scroll pane, a coloured or font-named label) and falls
+    // back to the plain layout on a host that does not list it.
+    let host = super::host_info();
+    let widgets = host["widgets"].as_array().expect("`init.host.widgets` is a list");
+    for wanted in ["list", "scroll", "label.color", "label.font", "button.icon"] {
+        assert!(widgets.iter().any(|w| w == wanted), "{wanted:?} missing from {widgets:?}");
+    }
+    assert_eq!(host["name"], "PhotoCraft");
 }

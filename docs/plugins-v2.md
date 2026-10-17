@@ -125,10 +125,10 @@ may carry several operations, and they are applied in order.
 
 | Event | Shape | When |
 |---|---|---|
-| `init` | `{"type":"init","now":…,"host":{…},"locale":"en-US","storage":{…},"entropy":"<hex>","grants":{…}}` | Once, when the instance starts. `host` is `{"name":"PhotoCraft","version":…,"build":…,"platform":…,"arch":…}`; `storage` is everything this plug-in stored in earlier sessions; `entropy` is 32 bytes of hex from the clock and a counter, for seeding a PRNG; `grants` is `{"storage": <declared>, "document": […], "network": null, "commands": […]}` — what the host actually allows, where `commands` is the engine commands this panel may ask for with `doc.command` (empty when the manifest asks for no document capability). |
+| `init` | `{"type":"init","now":…,"host":{…},"locale":"en-US","storage":{…},"entropy":"<hex>","grants":{…}}` | Once, when the instance starts. `host` is `{"name":"PhotoCraft","version":…,"build":…,"platform":…,"arch":…,"widgets":[…]}`; `widgets` lists the newer widget features this host draws (`list`, `scroll`, `label.color`, `label.font`, `button.icon`), so a panel built once can fall back to a plain layout on a host that lacks one. `storage` is everything this plug-in stored in earlier sessions; `entropy` is 32 bytes of hex from the clock and a counter, for seeding a PRNG; `grants` is `{"storage": <declared>, "document": […], "network": null, "commands": […]}` — what the host actually allows, where `commands` is the engine commands this panel may ask for with `doc.command` (empty when the manifest asks for no document capability). |
 | `panel.visible` | `{"type":"panel.visible","now":…,"visible":bool}` | The panel was shown or hidden. A plug-in may pause polling while hidden. |
 | `doc.changed` | `{"type":"doc.changed","now":…,"doc":<document or null>,"revision":n}` | The active document changed (id or revision), or was closed (`doc` is `null`), since the panel last heard. Sent from `plugin.panel.tick`. |
-| `ui.click` | `{"type":"ui.click","now":…,"id":"<widget>","values":{…}}` | A button was pressed. `values` is every input's current value. |
+| `ui.click` | `{"type":"ui.click","now":…,"id":"<widget>","values":{…}}` | A widget was pressed. `values` is every input's current value. A `list` row adds `"value": <row index>`; other widgets send no `value`. |
 | `ui.change` | `{"type":"ui.change","now":…,"id":"<widget>","value":…,"values":{…}}` | An input was committed: Enter, focus lost, slider released, choice picked. Not sent per keystroke. |
 | `result` | `{"type":"result","now":…,"id":…,"ok":bool, …fields}` | An operation that carried an `id` finished, or a timer came due. On success the operation's fields are merged in; on failure the event carries `"error": "<message>"`. |
 | `cancel` | `{"type":"cancel","now":…}` | The user pressed Cancel on the panel's progress bar. |
@@ -277,8 +277,12 @@ One undo step, adding 1–32 layers:
 
 ## Views
 
-A `ui.view` describes widgets; the host draws them with egui and `theme::Tokens`. A plug-in cannot
-choose a colour, font or size, so a panel is on-theme in light and dark in every theme for free.
+A `ui.view` describes widgets; the host draws them with egui and `theme::Tokens`. A plug-in
+normally cannot choose a colour, font or size, so a panel is on-theme in light and dark in every
+theme for free. The exceptions are deliberate and strictly bounded: a `label` (and a `list` row)
+may name a `#rrggbb` colour and a host font family, and a `button` may carry a short glyph `icon`.
+A font is a *name* only — the host resolves it from its own font database, the plug-in never touches
+font files, and an unknown family falls back to the theme's text font.
 The tree is checked whole: at most 512 widgets, at most 16 levels deep, at most 256 options in a
 `choice`. Labels, section titles and placeholders are at most 256 characters; a `text` value is at
 most 65 536 characters, or the widget's own `maxLength` when that is smaller.
@@ -288,12 +292,14 @@ most 65 536 characters, or the widget's own `maxLength` when that is smaller.
 | `column` | `children` | children stacked vertically | — |
 | `row` | `children` | children in a wrapping line | — |
 | `section` | `title`, `collapsed` (default `false`), `children` | a collapsible group; open/closed is remembered by the host per panel | — |
-| `label` | `text`, `level` (optional) | plain text, no markup; wraps. `level` is `muted`, `info`, `warning` or `error` | — |
+| `label` | `text`, `level` (optional), `color` (optional), `font` (optional) | plain text, no markup; wraps. `level` is `muted`, `info`, `warning` or `error`; `color` is `#rrggbb`; `font` is a host family name | — |
 | `text` | `id`, `value`, `placeholder`, `multiline` (default `false`), `maxLength` | a prompt field; with `multiline`, a taller scrolling script box | `ui.change` with the string |
 | `number` | `id`, `value`, `min`, `max`, `step`, `slider` (default `false`) | a field, or a slider when `slider` is set; `step` snaps to its grid | `ui.change` with the number |
 | `toggle` | `id`, `value`, `label` | a checkbox | `ui.change` with the bool |
 | `choice` | `id`, `value`, `options: [{"value","label"}]` | a dropdown; `value` must be one of the options | `ui.change` with the string |
-| `button` | `id`, `label`, `primary` (default `false`), `enabled` (default `true`) | a button; a disabled one shows a hover hint | `ui.click` |
+| `button` | `id`, `label`, `primary` (default `false`), `enabled` (default `true`), `icon` (optional) | a button; with `icon`, a square glyph button whose `label` is its hover hint; a disabled one shows a hover hint | `ui.click` |
+| `list` | `id`, `rows: [{"text","color","font"}]`, `selected` (optional), `numbered` (default `false`) | selectable rows of one line each; `selected` is drawn highlighted; `numbered` adds a line-number gutter | `ui.click` with the row index |
+| `scroll` | `id`, `children`, `footer` (optional), `height` (optional), `weight` (default `1`) | a pane with its own scrollbar; `footer` is pinned to its bottom; inside a `column`, height-less panes share the free height by `weight` | — |
 | `progress` | `fraction` (number or `null`) | a bar inside the panel; `null` is indeterminate | — |
 | `image` | `blob`, `maxHeight` (optional) | see **Document images** | — |
 | `separator` | — | a hairline | — |
@@ -305,17 +311,27 @@ most 65 536 characters, or the widget's own `maxLength` when that is smaller.
   {"type": "text", "id": "prompt", "value": "", "multiline": true, "placeholder": "Describe the image"},
   {"type": "section", "title": "Settings", "collapsed": true, "children": [
     {"type": "number", "id": "steps", "value": 4, "min": 1, "max": 50, "step": 1, "slider": true}]},
-  {"type": "button", "id": "generate", "label": "Generate", "primary": true},
+  {"type": "row", "children": [
+    {"type": "button", "id": "paste", "label": "Paste", "icon": "▣"},
+    {"type": "label", "text": "Bubble #3", "font": "Inter", "color": "#ff8800"}]},
+  {"type": "scroll", "id": "styles", "weight": 2, "children": [
+    {"type": "list", "id": "style", "numbered": true, "selected": 1,
+     "rows": [{"text": "Shout", "font": "Bangers"}, {"text": "Whisper", "font": "Pacifico"}]}],
+   "footer": [{"type": "button", "id": "generate", "label": "Generate", "primary": true}]},
   {"type": "label", "text": "connected", "level": "muted"}]}
 ```
 
-- **Ids.** `text`, `number`, `toggle`, `choice` and `button` have an `id`: 1–64 characters from
-  `A-Z a-z 0-9 . _ -`, unique within the view. `column`, `row`, `section`, `label`, `progress`,
-  `image` and `separator` have none.
+- **Ids.** `text`, `number`, `toggle`, `choice`, `button`, `list` and `scroll` have an `id`:
+  1–64 characters from `A-Z a-z 0-9 . _ -`, unique within the view. `column`, `row`, `section`,
+  `label`, `progress`, `image` and `separator` have none.
 - **Ranges.** A `number` needs finite `value`, `min` and `max` with `min <= max`, and a positive
   finite `step` if given. A `choice` needs `value` to be one of its options; each option needs a
   non-empty value of at most 256 bytes and a label of at most 256 characters. A `progress` fraction
-  is `0..=1` or `null`.
+  is `0..=1` or `null`. A `list` has at most 1000 rows, each row text is at most 65 536 characters,
+  and `selected` (0-based) must be below the row count. A `color` is exactly `#rrggbb`. A `font`
+  is a non-empty family name of at most 128 characters without control characters. A `scroll`
+  `height` is finite and `0..=4000`; its `weight` is `1..=16`. A `button.icon` is at most 8
+  characters and should be a single glyph.
 - **Text editing.** The host buffers what is typed. A `text` is committed as `ui.change` when the
   widget **loses focus** and the buffer differs from the value the host holds; egui ends a
   single-line edit on Enter, so Enter commits a single-line field, while Enter in a `multiline`
@@ -324,7 +340,16 @@ most 65 536 characters, or the widget's own `maxLength` when that is smaller.
   plug-in's value wins.
 - **Layout.** The panel is a resizable floating window: `panel.minWidth` is both its default and
   its minimum width, its body scrolls vertically (up to 600 px tall), and fields take the available
-  width. `panel.title` is the window title.
+  width. `panel.title` is the window title. A view that contains a `scroll` pane is laid out
+  without the body's scrollbar: the panes share the panel's height and scroll independently.
+- **Feature detection.** `init.host.widgets` lists what this host draws. A module built once can
+  check it (for example for `"list"`, `"scroll"`, `"label.color"`, `"label.font"`,
+  `"button.icon"`) and send a plain `column`/`label`/`text` view to a host that lacks one; an
+  unknown widget `type` fails validation, so the check — not a hopeful `ui.view` — is the fallback.
+- **Fonts.** A `font` is resolved by the host from its own font database and registered for the
+  panel only; the plug-in never supplies bytes and has no access to font files. An unknown family,
+  or one over the host's per-panel budget, is drawn in the theme's text font — never an error. The
+  first frame after a new family appears draws it in the fallback and asks for one more frame.
 - **Not drawn.** An `image` is drawn as a placeholder row (`[<blob>] Image`) with a hover hint,
   because this host hands out no blobs (see below).
 

@@ -461,6 +461,26 @@ impl FontDb {
         self.faces(family).into_iter().find(|f| f.style.eq_ignore_ascii_case(style))
     }
 
+    /// The bytes and face index of a family's regular face, for a caller that draws text itself.
+    ///
+    /// Panel plug-ins name a family for a label (TypeR shows each style's name in the font it
+    /// letters in), and the host resolves that name here rather than letting a plug-in touch a font
+    /// file. `None` for a family this machine does not have, so the caller draws its own font — an
+    /// unknown name must never be an error. Huge files (some CJK collections) are refused rather
+    /// than copied into the UI: no panel label is worth tens of megabytes.
+    pub fn ui_face(&mut self, family: &str) -> Option<(Vec<u8>, u32)> {
+        /// The most a single UI font may add to the process. The UI keeps every registered family
+        /// for its lifetime, so this bounds what a panel naming many families can cost.
+        const MAX_UI_FACE_BYTES: usize = 32 * 1024 * 1024;
+        let info = self.fcx.collection.family_by_name(family)?;
+        let face = info.match_font(FontWidth::default(), FontStyle::Normal, FontWeight::new(400.0), true)?;
+        let blob = face.load(Some(&mut self.fcx.source_cache))?;
+        if blob.len() > MAX_UI_FACE_BYTES {
+            return None;
+        }
+        Some((blob.as_ref().to_vec(), face.index()))
+    }
+
     /// Select an exact face for shaping. Private aliases are runtime-only: the document keeps
     /// its public family and PostScript name. CSS matching alone cannot distinguish e.g. the
     /// numeric subfamilies of Yoon fonts, all of which declare weight 400 / normal.
@@ -826,6 +846,20 @@ mod tests {
         let mut v = [".Hiragino Kaku Gothic Interface".to_string(), "Hiragino Kaku Gothic ProN".to_string()];
         v.sort_by_key(|n| (super::is_hidden_family(n), n.to_lowercase()));
         assert_eq!(v[0], "Hiragino Kaku Gothic ProN");
+    }
+
+    /// A UI label may name a family (a plug-in's style preview). The host resolves it to bytes from
+    /// its own database; an unknown family is `None`, never an error, so the caller falls back.
+    #[test]
+    fn a_ui_face_is_bytes_for_a_known_family_and_none_for_an_unknown_one() {
+        let mut db = super::FontDb::new();
+        let (bytes, index) = db.ui_face(super::DEFAULT_FAMILY).expect("the default bundled family has a regular face");
+        assert!(!bytes.is_empty());
+        assert!(bytes.starts_with(b"\x00\x01\x00\x00") || bytes.starts_with(b"OTTO") || bytes.starts_with(b"ttcf"), "a font file, not a blob of something else");
+        assert_eq!(index, 0, "the bundled default is a single-face file");
+        assert!(db.ui_face("this family is not installed anywhere").is_none());
+        // Hidden private families are not offered by name, and do not resolve.
+        assert!(db.ui_face("").is_none());
     }
 
     #[test]

@@ -575,9 +575,16 @@ pub fn init(now_ms: u64, host: Value, locale: &str, storage: &Map<String, Value>
     event("init", now_ms, json!({"host": host, "locale": locale, "storage": storage, "entropy": entropy, "grants": grants}))
 }
 
-/// A button press: the pressed id plus every input's current value.
-pub fn ui_click(now_ms: u64, id: &str, values: &Map<String, Value>) -> Value {
-    event("ui.click", now_ms, json!({"id": id, "values": values}))
+/// A press: the pressed id plus every input's current value.
+///
+/// `value` is what the widget reports beyond its id: a `list` row's index, and nothing (`null`) for
+/// a button. It is sent only when there is one, so a button's event keeps the shape it always had.
+pub fn ui_click(now_ms: u64, id: &str, value: &Value, values: &Map<String, Value>) -> Value {
+    let mut only = json!({"id": id, "values": values});
+    if let (Some(map), false) = (only.as_object_mut(), value.is_null()) {
+        map.insert("value".into(), value.clone());
+    }
+    event("ui.click", now_ms, only)
 }
 
 /// A committed input: Enter, focus lost, slider released, choice picked. Not sent per keystroke.
@@ -773,9 +780,14 @@ mod tests {
 
         let mut values = Map::new();
         values.insert("prefix".into(), json!("/A"));
-        let click = ui_click(9, "insert", &values);
+        let click = ui_click(9, "insert", &Value::Null, &values);
         assert_eq!((click["type"].clone(), click["id"].clone(), click["now"].clone()), (json!("ui.click"), json!("insert"), json!(9)));
         assert_eq!(click["values"]["prefix"], "/A");
+        assert!(click.get("value").is_none(), "a button reports no value");
+
+        let row = ui_click(9, "scriptLine", &json!(3), &values);
+        assert_eq!(row["value"], 3, "a list row reports its index");
+        assert_eq!(row["values"]["prefix"], "/A");
 
         let change = ui_change(9, "size", &json!(12), &values);
         assert_eq!(change["value"], 12);
