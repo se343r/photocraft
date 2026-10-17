@@ -511,6 +511,160 @@ fn a_panel_window_is_as_wide_as_its_panel_and_no_wider() {
     assert!(widths[23] < 500.0, "the panel is as wide as the panel, not as wide as the widget: {}", widths[23]);
 }
 
+/// The TypeR port's page, as the ABI lets a plug-in draw it: the preview and the line/size rows at
+/// the top, then the two `scroll` panes that share the rest — the script on the left of the share
+/// (weight 2) and the styles on the right (weight 3), each pinning its own footer.
+fn type_r_page() -> Value {
+    let rows: Vec<Value> = (0..20)
+        .map(|i| json!({"text": format!("{i:>4} Dòng hội thoại số {i}, dài vừa phải để thử bề rộng")}))
+        .collect();
+    json!({"type":"column","children":[
+        {"type":"label","text":"Line 88 / 142"},
+        {"type":"label","text":"DIALOGUE: chắc chắn rất nhiều người đã được cứu rồi nhớ tình cảm tươi sáng của cô ấy"},
+        {"type":"label","text":"Prefix colour #FF6A4, shown on the style's row","level":"muted"},
+        {"type":"row","children":[
+            {"type":"label","text":"Line"},
+            {"type":"number","id":"lineNo","value":87.0,"min":1.0,"max":142.0,"step":1.0,"slider":false},
+            {"type":"button","id":"prev","label":"◀","icon":"◀"},
+            {"type":"button","id":"next","label":"▶","icon":"▶"},
+            {"type":"button","id":"first","label":"⏮","icon":"⏮"},
+            {"type":"button","id":"last","label":"⏭","icon":"⏭"}]},
+        {"type":"separator"},
+        {"type":"row","children":[{"type":"label","text":"Text size"},
+            {"type":"number","id":"textScale","value":100.0,"min":1.0,"max":999.0,"step":1.0,"slider":true},
+            {"type":"label","text":"%"}]},
+        {"type":"label","text":"Text size scales the style's size (and its leading) when a line is created or inserted.","level":"muted"},
+        {"type":"separator"},
+        {"type":"row","children":[{"type":"button","id":"create","label":"Create","primary":true},
+            {"type":"button","id":"insert","label":"Insert"},{"type":"button","id":"align","label":"Align"}]},
+        {"type":"row","children":[{"type":"button","id":"sizeDown","label":"A−","icon":"A−"},
+            {"type":"button","id":"sizeUp","label":"A+","icon":"A+"},
+            {"type":"button","id":"apply","label":"Apply style"},
+            {"type":"button","id":"applyKeep","label":"Apply, keep size"}]},
+        {"type":"label","text":"A−/A+ step the type by 1 pt and keep the layer where it is. Apply puts the current style on the selected layers without touching what they say.","level":"muted"},
+        {"type":"separator"},
+        {"type":"scroll","id":"scriptPane","weight":2,"children":[
+            {"type":"row","children":[{"type":"label","text":"Script"},{"type":"label","text":"one line of dialogue per row","level":"muted"}]},
+            {"type":"list","id":"scriptLine","selected":87,"numbered":true,"rows":rows},
+            {"type":"text","id":"script","value":"một hai ba\nbốn năm sáu","placeholder":"One line of dialogue per row.","multiline":true,"maxLength":65536}],
+         "footer":[{"type":"row","children":[{"type":"toggle","id":"hideDone","value":false,"label":"Hide finished lines"},
+            {"type":"label","text":"No rows finished yet","level":"muted"}]}]},
+        {"type":"scroll","id":"stylesPane","weight":3,"children":[
+            {"type":"label","text":"Dialogue (4 style(s))"},
+            {"type":"row","children":[{"type":"label","text":"DIALOGUE [D: D]","color":"#FF6A4","font":"000 TeddyBear"},
+                {"type":"button","id":"size-","label":"−"},{"type":"number","id":"sz0","value":28.0,"min":1.0,"max":999.0,"step":1.0,"slider":false},
+                {"type":"button","id":"size+","label":"+"},{"type":"button","id":"apply0","label":"Apply"},{"type":"button","id":"edit0","label":"Edit"}]},
+            {"type":"row","children":[{"type":"label","text":"Whisper [W: W]","color":"#F58A8A"},
+                {"type":"button","id":"size-1","label":"−"},{"type":"number","id":"sz1","value":28.0,"min":1.0,"max":999.0,"step":1.0,"slider":false},
+                {"type":"button","id":"size+1","label":"+"},{"type":"button","id":"apply1","label":"Apply"},{"type":"button","id":"edit1","label":"Edit"}]},
+            {"type":"row","children":[{"type":"label","text":"Style for lines with no prefix"},
+                {"type":"choice","id":"defaultStyle","value":"dialogue","options":[{"value":"dialogue","label":"Dialogue"}]}]}],
+         "footer":[{"type":"row","children":[{"type":"button","id":"newStyle","label":"New style"},
+            {"type":"button","id":"openSettings","label":"⚙","icon":"⚙"},
+            {"type":"button","id":"openHelp","label":"?","icon":"?"}]}]}
+    ]})
+}
+
+/// The same page with the separator and the two muted status lines the real port puts *after* its
+/// panes: the widgets that had nowhere left to go.
+fn type_r_page_with_trailing() -> Value {
+    let mut v = type_r_page();
+    let kids = v["children"].as_array_mut().expect("children");
+    kids.push(json!({"type":"separator"}));
+    kids.push(json!({"type":"label","text":"40 x 28 px at 72 dpi, no selection, no type layer selected","level":"muted"}));
+    kids.push(json!({"type":"label","text":"Loaded the starter style library.","level":"muted"}));
+    v
+}
+
+/// A pane view's widgets that come *after* the panes must not grow the panel, frame after frame.
+///
+/// A pane is given the height that is left, so anything drawn under it had nowhere to go: the tree
+/// came out taller than the panel it was drawn in, and the window — sized from its content every
+/// frame — grew by exactly that surplus again each frame, without end. The TyperTools port's panel
+/// grew 64 px a frame this way. Whatever follows the last pane is now reserved from the bottom
+/// before the panes are given their share, so the tree fits its panel and the size settles.
+#[test]
+fn widgets_under_a_pane_do_not_grow_the_panel() {
+    let panel = test_panel("test.pane-tail", type_r_page_with_trailing());
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    let mut sizes = Vec::new();
+    let mut last = Vec::new();
+    for _ in 0..30 {
+        let shapes = draw_panel(&ctx, &panel, egui::RawInput { screen_rect: Some(canvas()), ..Default::default() }, false);
+        last = shapes;
+        let rect = panel_window_rect(&ctx, "test.pane-tail");
+        let rect = rect.expect("the panel was drawn");
+        sizes.push(rect.size());
+    }
+    let heights: Vec<f32> = sizes.iter().map(|s| s.y).collect();
+    let widths: Vec<f32> = sizes.iter().map(|s| s.x).collect();
+    assert!(settled(&heights), "the panel grew under its panes, frame by frame: {heights:?}");
+    assert!(settled(&widths), "and it did not widen itself either: {widths:?}");
+    // A panel fits the room it is drawn in; the one that grew ran past the bottom of the screen.
+    assert!(heights[29] <= canvas().height(), "the panel is taller than the screen: {}", heights[29]);
+
+    // The status lines under the panes are the reason the tail is reserved, so they are drawn —
+    // at the panel's bottom, where the real port puts them, and not pushed off the edge.
+    let y = painted_y(&last, "Loaded the starter style library");
+    let y = y.expect("the status line under the panes was drawn");
+    assert!(y < canvas().bottom(), "the status line was painted past the panel's bottom edge: {y}");
+}
+
+/// The real TypeR plug-in, drawn in the real window, is left alone: it needs its wasm built
+/// (`typertools-src/photocraft/build.sh`, a repository of its own), so it is opt-in and reads the
+/// built file from `PHOTOCRAFT_TYPER_WASM`. Run it with
+///
+/// ```sh
+/// PHOTOCRAFT_TYPER_WASM=/path/to/typer.wasm \
+///     cargo test -p photocraft-ui-egui --lib the_real_typer_panel_settles -- --ignored
+/// ```
+///
+/// Run it on its own, as the filter above does: the panels are process-wide, so while this one is
+/// open and ticking, the other panel tests draw *this* window too and a click meant for theirs
+/// lands on it. Alone, nothing else is asking for a click.
+#[test]
+#[ignore = "needs the ported plug-in built; set PHOTOCRAFT_TYPER_WASM to run it"]
+fn the_real_typer_panel_settles() {
+    let Ok(wasm) = std::env::var("PHOTOCRAFT_TYPER_WASM") else {
+        eprintln!("PHOTOCRAFT_TYPER_WASM is unset: skipping");
+        return;
+    };
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    let mut h = harness();
+    let app = h.state_mut();
+    app.run("plugin.install", json!({"path": wasm})).expect("the plug-in installs");
+    app.run("plugin.panel.open", json!({"id": "org.photocraft.typer"})).expect("the panel opens");
+    let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1920.0, 1048.0));
+    let mut sizes = Vec::new();
+    for frame in 0..40u32 {
+        let _ = h.state_mut().run_background("plugin.panel.tick", json!({}));
+        let panels = photocraft_engine::plugin_panel_cmds::draw_list();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |root| {
+            let ctx = root.ctx().clone();
+            let t = Tokens::get(&ctx);
+            let mut pending = Pending::default();
+            for (i, panel) in panels.iter().enumerate() {
+                if !panel.visible {
+                    continue;
+                }
+                let _ = super::window(&ctx, &t, panel, i, canvas, &mut pending, frame == 0);
+            }
+        });
+        out.textures_delta.clear();
+        let rect = ctx.memory(|m| m.area_rect(egui::Id::new(("plugin-panel-v2", "org.photocraft.typer"))));
+        sizes.push(rect.map_or(egui::Vec2::ZERO, |rect| rect.size()));
+    }
+    let _ = h.state_mut().run("plugin.panel.close", json!({"id": "org.photocraft.typer"}));
+    let _ = h.state_mut().run("plugin.remove", json!({"id": "org.photocraft.typer"}));
+    let heights: Vec<f32> = sizes.iter().map(|s| s.y).collect();
+    let widths: Vec<f32> = sizes.iter().map(|s| s.x).collect();
+    assert!(settled(&widths), "the ported panel widened itself, frame by frame: {widths:?}");
+    assert!(settled(&heights), "the ported panel grew, frame by frame: {heights:?}");
+    assert!(heights[39] <= canvas.height(), "the ported panel is taller than the screen: {}", heights[39]);
+}
+
 /// A script box, with a chapter in it, is painted inside its own 150 px and no further.
 ///
 /// A `TextEdit` is as tall as its text. Before the box scrolled, a long script was laid out at 150

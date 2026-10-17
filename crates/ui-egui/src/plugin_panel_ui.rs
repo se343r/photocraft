@@ -490,10 +490,37 @@ fn body(ui: &mut egui::Ui, t: &Tokens, panel: &PanelDraw, widget: &Widget, pendi
                 // (a page switcher, a preview) are paid for first, and is proportional to the
                 // weights left, so two panes keep their ratio. Anything that must stay visible
                 // under a pane belongs in that pane's `footer`.
-                let mut weights_left: u32 =
-                    if flow == Flow::Panes { children.iter().filter_map(pane_weight).map(u32::from).sum() } else { 0 };
-                for child in children {
-                    match (flow == Flow::Panes).then(|| pane_weight(child)).flatten() {
+                //
+                // Whatever follows the *last* pane is reserved before the panes are given anything.
+                // A pane took the whole height that was left, so widgets under it had nowhere to go:
+                // the tree came out taller than the panel it was drawn in, and the window — sized
+                // from its content every frame — grew by exactly that much, every frame, without
+                // end. The TypeR port ends its page with two status lines under its panes, which
+                // grew its panel by 64 px a frame; a slower frame rate is a slower creep, not a
+                // smaller one. Reserved from the bottom first, the panes share what is left and the
+                // tree still fits.
+                let panes = flow == Flow::Panes;
+                let last_pane = if panes { children.iter().rposition(|child| pane_weight(child).is_some()) } else { None };
+                let (taken, tail): (&[Widget], &[Widget]) = match last_pane {
+                    Some(last) if last + 1 < children.len() => children.split_at(last + 1),
+                    _ => (children.as_slice(), &[]),
+                };
+                if !tail.is_empty() {
+                    // The panel's own id and this column's, so two columns in one view get a panel
+                    // each. Drawn before the panes, because a `Panel` reserves its strip and leaves
+                    // the rest to what is drawn after it.
+                    let id = egui::Id::new(("plugin-panel-tail", panel.id.as_str(), ui.id()));
+                    egui::Panel::bottom(id).frame(egui::Frame::NONE).show(ui, |ui| {
+                        at_panel_width(ui, |ui| {
+                            for child in tail {
+                                body(ui, t, panel, child, pending, flow, None);
+                            }
+                        });
+                    });
+                }
+                let mut weights_left: u32 = if panes { taken.iter().filter_map(pane_weight).map(u32::from).sum() } else { 0 };
+                for child in taken {
+                    match panes.then(|| pane_weight(child)).flatten() {
                         Some(weight) => {
                             let share = ui.available_height().max(MIN_PANE) * f32::from(weight) / weights_left.max(1) as f32;
                             weights_left = weights_left.saturating_sub(u32::from(weight));
