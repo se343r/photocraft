@@ -551,9 +551,27 @@ pub(crate) fn check_text_unlocked(doc: &Document, id: LayerId) -> Result<()> {
     Ok(())
 }
 
+/// Whether this command's params ask for the pixel selection to be dropped in the same undo step.
+///
+/// Placing lettering is the case: the marquee has been used to measure where the line goes, the line
+/// is in the document, and marching ants left over the balloon are in the way of the next one. Doing
+/// it inside the step that made the layer is what makes the two one thing to undo — and it is why
+/// this is a param rather than a panel calling `select.deselect`, which a panel may not run at all
+/// (`plugin_panel_cmds::permissions`).
+fn drops_selection(p: &Value) -> bool {
+    p.get("deselect").and_then(Value::as_bool).unwrap_or(false)
+}
+
 /// Runs `f` on a type layer as one undo step. `f` may set an explicit layer name (`type.edit`'s
 /// `name`), which is applied in the same step; otherwise an auto-named layer follows its text.
-fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut TextLayer, &Document, &mut Option<String>) -> Result<R>) -> Result<R> {
+/// `deselect` drops the pixel selection in the same step; see [`drops_selection`].
+fn with_text_layer<R>(
+    s: &mut Session,
+    p: &Value,
+    label: &str,
+    deselect: bool,
+    f: impl FnOnce(&mut TextLayer, &Document, &mut Option<String>) -> Result<R>,
+) -> Result<R> {
     let id = layer_id(s, p)?;
     check_text_unlocked(&s.active().ok_or(EngineError::NoDocument)?.doc, id)?;
     let (r, damage) = s.edit(label, |doc, _| {
@@ -573,6 +591,10 @@ fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&m
         let name = rename.or_else(|| auto_named.then(|| layer_name(&t.text)));
         if let Some(n) = name {
             l.name = n;
+        }
+        // The line is in the layer, so the marquee has done its job: dropped here, in the same step.
+        if deselect {
+            doc.selection = None;
         }
         Ok((r, damage))
     })?;
@@ -794,16 +816,22 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "New Type Layer",
             menu: &["Layer", "New"],
             shortcut: None,
-            params: r##"{"x":px,"y":px (baseline anchor of point text),"text":str,"box":[x,y,w,h]? (paragraph text),"name":str?,"align":"left|center|right|justify…"?,"orientation":"horizontal|vertical"="horizontal", …character keys: "font","size":pt=12,"color",…}"##,
+            params: r##"{"x":px,"y":px (baseline anchor of point text),"text":str,"box":[x,y,w,h]? (paragraph text),"name":str?,"align":"left|center|right|justify…"?,"orientation":"horizontal|vertical"="horizontal","deselect":bool=false (drop the pixel selection in the same step)," …character keys: "font","size":pt=12,"color",…}"##,
             enabled: has_doc,
             journal: true,
             run: |s, p| {
+                let deselect = drops_selection(p);
                 let mut t = new_text_layer(s, p, "type.create")?;
                 let name = p.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| layer_name(&t.text));
                 let id = s.edit("New Type Layer", |doc, active| {
                     refresh(doc, &mut t);
                     let id = doc.insert_above(*active, Layer::new(name, LayerContent::Text(t)));
                     *active = Some(id);
+                    // The line has been placed, so the marquee has done its job: dropped here rather
+                    // than in a step of its own, so one ⌘Z takes the line and the ants together.
+                    if deselect {
+                        doc.selection = None;
+                    }
                     Ok(id)
                 })?;
                 let bounds = s.active().and_then(|d| d.doc.layer(id)).and_then(|l| l.surface()).map(|c| c.content_bounds());
@@ -822,7 +850,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Edit Type",
             menu: &[],
             shortcut: None,
-            params: r##"{"layer":id?,"text":str? (replace all, styles kept),"replace":{"start":char,"end":char,"text":str}?,"runs":[{"start":char,"end":char,…character keys}]?,"box":[x,y,w,h]? (to paragraph text),"point":[x,y]? (to point text),"move":[dx,dy]?,"transform":[a,b,c,d,e,f]?,"antialias":"none|sharp|crisp|strong|smooth"?,"name":str?,"kerning":1/1000em|"metrics"|"optical"|"off"? (with "range":[startChar,endChar]?, default all),"kernPair":{"at":caretChar,"by":1/1000em}? (Alt+←/→: the pair before the caret becomes manual, its current kerning + by)}"##,
+            params: r##"{"layer":id?,"text":str? (replace all, styles kept),"replace":{"start":char,"end":char,"text":str}?,"runs":[{"start":char,"end":char,…character keys}]?,"box":[x,y,w,h]? (to paragraph text),"point":[x,y]? (to point text),"move":[dx,dy]?,"transform":[a,b,c,d,e,f]?,"antialias":"none|sharp|crisp|strong|smooth"?,"name":str?,"deselect":bool=false (drop the pixel selection in the same step),"kerning":1/1000em|"metrics"|"optical"|"off"? (with "range":[startChar,endChar]?, default all),"kernPair":{"at":caretChar,"by":1/1000em}? (Alt+←/→: the pair before the caret becomes manual, its current kerning + by)}"##,
             enabled: has_doc,
             journal: true,
             run: |s, p| {
@@ -856,7 +884,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     }
                 };
                 let label = if kern_pair.is_some() { "Kerning" } else { "Edit Type" };
-                with_text_layer(s, p, label, |t, doc, rename| {
+                with_text_layer(s, p, label, drops_selection(p), |t, doc, rename| {
                     if let Some((at, by)) = kern_pair {
                         // Photoshop's Alt+←/→: the pair before the caret becomes manually kerned,
                         // starting from what it shows now (its metrics/optical or manual value).
@@ -1064,7 +1092,7 @@ fn size_key(id: &'static str, label: &'static str, shortcut: &'static str, run: 
 fn step_size(s: &mut Session, p: &Value, up: bool, default_by: f32) -> Result<Value> {
     let id = layer_id(s, p)?;
     let by = f32p(p, "by").filter(|v| v.is_finite()).unwrap_or(default_by).abs().min(TYPE_SIZE_MAX_PT as f32);
-    with_text_layer(s, p, "Change Type Size", |t, _, _| {
+    with_text_layer(s, p, "Change Type Size", false, |t, _, _| {
         let m = t.transform.m;
         let scale = (m[0] * m[3] - m[1] * m[2]).abs().sqrt() as f32;
         let scale = if scale.is_finite() && scale > 1e-3 { scale } else { 1.0 };
@@ -1091,6 +1119,60 @@ mod tests {
             LayerContent::Text(t) => t.clone(),
             other => panic!("{}", other.kind_name()),
         }
+    }
+
+    fn with_a_selection(s: &mut Session) {
+        s.execute("select.rect", json!({"x": 4, "y": 5, "width": 40, "height": 30})).unwrap();
+        assert!(s.active().unwrap().doc.selection.is_some(), "the marquee is up");
+    }
+
+    fn history(s: &Session) -> Vec<String> {
+        s.active().unwrap().history.entries()
+    }
+
+    /// `"deselect": true` is how a lettering panel places a line: the marquee measured where the line
+    /// goes, the line is in, and the ants left over the balloon are in the way of the next one. One
+    /// step, so a single undo takes the line and the ants together.
+    #[test]
+    fn placing_a_line_can_drop_the_pixel_selection() {
+        let mut s = session();
+        with_a_selection(&mut s);
+        let before = history(&s).len();
+        let id = s.execute("type.create", json!({"text": "Hi", "size": 24, "x": 10, "y": 20, "deselect": true})).unwrap()["layer"].as_u64().unwrap();
+        assert!(s.active().unwrap().doc.selection.is_none(), "the marquee is gone");
+        assert_eq!(s.active().unwrap().active_layer, Some(LayerId(id)), "and the new layer is the one selected");
+        assert_eq!(history(&s).len(), before + 1, "one step: {:?}", history(&s));
+    }
+
+    /// Without the flag — the default — the marquee is the user's and stays theirs. Every other
+    /// caller of `type.create` (the Type tool, scripts, `automate.*`) gets this.
+    #[test]
+    fn placing_a_line_leaves_the_marquee_alone_without_the_flag() {
+        for params in [json!({"text": "Hi", "size": 24, "x": 10, "y": 20}), json!({"text": "Hi", "size": 24, "x": 10, "y": 20, "deselect": false})] {
+            let mut s = session();
+            with_a_selection(&mut s);
+            s.execute("type.create", params.clone()).unwrap();
+            assert!(s.active().unwrap().doc.selection.is_some(), "the marquee survives: {params}");
+        }
+    }
+
+    /// Insert writes the line into the layers the letterer picked and Align re-shapes them, so
+    /// neither makes a layer: both go through `type.edit`, and it takes the same flag.
+    #[test]
+    fn editing_a_line_can_drop_the_pixel_selection_too() {
+        let mut s = session();
+        let id = s.execute("type.create", json!({"text": "Hi", "size": 24, "x": 10, "y": 20})).unwrap()["layer"].as_u64().unwrap();
+        with_a_selection(&mut s);
+        let before = history(&s).len();
+        s.execute("type.edit", json!({"layer": id, "text": "There", "deselect": true})).unwrap();
+        assert_eq!(text_layer(&s, id).text, "There");
+        assert!(s.active().unwrap().doc.selection.is_none(), "the marquee is gone");
+        assert_eq!(history(&s).len(), before + 1, "one step: {:?}", history(&s));
+
+        // And the default leaves it, as `type.create` does.
+        with_a_selection(&mut s);
+        s.execute("type.edit", json!({"layer": id, "text": "Hi again"})).unwrap();
+        assert!(s.active().unwrap().doc.selection.is_some(), "the marquee survives an ordinary edit");
     }
 
     #[test]
