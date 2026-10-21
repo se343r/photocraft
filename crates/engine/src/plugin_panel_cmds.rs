@@ -27,8 +27,9 @@
 //! handling they will run under are already here.
 //!
 //! Instances are driven on the calling thread, under one process-wide lock. A hostile panel is
-//! bounded by the 2 s wall-clock budget of a single event and is then stopped for good, so it can
-//! delay other panels by at most that; giving each instance its own worker thread is the next step.
+//! bounded by one 2 s wall-clock budget per host call — shared by every event that call pumps, not
+//! granted afresh to each — and is then stopped for good, so it can delay other panels by at most
+//! that; giving each instance its own worker thread is the next step.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use photocraft_plugins::instance::{Failures, Instance};
 use photocraft_plugins::ops::{self, NoticeLevel, OpId, Operation};
-use photocraft_plugins::view::Widget;
+use photocraft_plugins::view::{self, Widget};
 use photocraft_plugins::{Capabilities, DocumentCap, Error as PluginError, Plugin, registry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -51,6 +52,18 @@ const MAX_PUMP_STEPS: usize = 64;
 const MAX_NOTICES: usize = 32;
 /// Stored values one panel may keep.
 const MAX_STORAGE_KEYS: usize = 256;
+/// Total bytes of those stored values, written as JSON: the ABI documents a 1 MiB store per
+/// plug-in (see `docs/plugins-v2.md`), and without a byte cap 256 keys could hold 256 MiB.
+const MAX_STORAGE_BYTES: usize = 1 << 20;
+/// Input values one panel may keep for the UI and its events.
+///
+/// A `ui.set` may arrive in reply after reply, each within the 1 MiB reply cap, so the map needs a
+/// bound of its own: without one a panel could grow host memory far past the sandbox's limits. One
+/// key per possible widget is plenty ([`photocraft_plugins::view::MAX_WIDGETS`]).
+const MAX_VALUE_KEYS: usize = 512;
+/// Total bytes of those values, written as JSON — generous beside the 1 MiB reply cap, small beside
+/// the 512 MiB a panel's own linear memory is allowed.
+const MAX_VALUE_BYTES: usize = 4 << 20;
 /// The locale the host reports in `init` (PhotoCraft's UI is English).
 const LOCALE: &str = "en-US";
 
@@ -208,12 +221,17 @@ struct Panel {
     steps: u64,
     /// Commands the panel asked for that the host has not run yet (see [`Ask`]).
     asked: Vec<Ask>,
+    /// Total bytes of [`PanelView::values`], kept as it changes so the cap costs no rescan.
+    value_bytes: usize,
+    /// Total bytes of [`Panel::storage`], likewise.
+    storage_bytes: usize,
 }
 
 impl Panel {
     fn new(plugin: Arc<Plugin>) -> Result<Panel> {
         // Whatever this plug-in stored last time, including in an instance that has since stopped.
         let storage = storages().get(plugin.id()).cloned().unwrap_or_default();
+        let storage_bytes = storage.values().map(json_bytes).sum();
         Ok(Panel {
             instance: Instance::start(plugin).map_err(err)?,
             view: PanelView::default(),
@@ -222,6 +240,8 @@ impl Panel {
             seen: None,
             steps: 0,
             asked: Vec::new(),
+            value_bytes: 0,
+            storage_bytes,
         })
     }
 
@@ -302,6 +322,17 @@ pub fn any_open() -> bool {
     !panels().is_empty()
 }
 
+/// Milliseconds until the next timer of a visible, running panel is due; `None` when no panel is
+/// waiting.
+///
+/// Timers are the one thing a panel asks for that happens without the user: an editor repaints only
+/// when something changes, so without this a panel whose timer polls a printer would fire when the
+/// pointer next moved rather than when it was due.
+pub fn next_timer_in() -> Option<u64> {
+    let now = now_ms();
+    panels().values().filter(|panel| panel.visible && panel.stopped().is_none()).filter_map(|panel| panel.instance.timers().next_due_in(now)).min()
+}
+
 /// What the host knows while it is carrying out a batch of operations.
 struct HostCtx<'a> {
     now: u64,
@@ -318,6 +349,60 @@ fn queue_result(panel: &mut Panel, ctx: &HostCtx, id: &OpId, outcome: std::resul
     panel.instance.queue_mut().push(event);
 }
 
+/// Bytes a value takes as JSON: what [`MAX_VALUE_BYTES`] counts.
+fn json_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value).map(|b| b.len()).unwrap_or(0)
+}
+
+/// Records one input value, refusing a map that would grow past the caps.
+fn insert_value(panel: &mut Panel, key: String, value: Value) -> Result<()> {
+    if !panel.view.values.contains_key(&key) && panel.view.values.len() >= MAX_VALUE_KEYS {
+        return Err(err(PluginError::Limit(format!("a panel may keep {MAX_VALUE_KEYS} input values"))));
+    }
+    let old = panel.view.values.get(&key).map(json_bytes).unwrap_or(0);
+    let total = panel.value_bytes.saturating_sub(old).saturating_add(json_bytes(&value));
+    if total > MAX_VALUE_BYTES {
+        return Err(err(PluginError::Limit(format!("a panel may keep {MAX_VALUE_BYTES} bytes of input values"))));
+    }
+    panel.value_bytes = total;
+    panel.view.values.insert(key, value);
+    Ok(())
+}
+
+/// Stores one value for the plug-in, refusing one that would grow the store past the caps, and
+/// writes through only that key.
+///
+/// The clone-and-replace this replaces copied the whole map on every operation: a reply of 64
+/// `storage.set`s copied a 1 MiB store 64 times, and the copies were thrown away.
+fn set_storage(panel: &mut Panel, key: String, value: Value) -> Result<()> {
+    let id = panel.instance.plugin().id().to_string();
+    if value.is_null() {
+        // The ABI's delete (see `ops::Operation::StorageSet`). Without it a panel could only ever add
+        // keys, and its 256 would be a one-way door.
+        if let Some(old) = panel.storage.remove(&key) {
+            panel.storage_bytes = panel.storage_bytes.saturating_sub(json_bytes(&old));
+        }
+        if let Some(store) = storages().get_mut(&id) {
+            store.remove(&key);
+        }
+        return Ok(());
+    }
+    if !panel.storage.contains_key(&key) && panel.storage.len() >= MAX_STORAGE_KEYS {
+        return Err(err(PluginError::Limit(format!("a panel may keep {MAX_STORAGE_KEYS} stored values"))));
+    }
+    let old = panel.storage.get(&key).map(json_bytes).unwrap_or(0);
+    let total = panel.storage_bytes.saturating_sub(old).saturating_add(json_bytes(&value));
+    if total > MAX_STORAGE_BYTES {
+        return Err(err(PluginError::Limit(format!("a panel may keep {MAX_STORAGE_BYTES} bytes of stored values"))));
+    }
+    panel.storage_bytes = total;
+    // Written through, so the next instance of this plug-in — a restart after a failure, or the
+    // panel reopened after `stop` — reads back what this one stored.
+    storages().entry(id).or_default().insert(key.clone(), value.clone());
+    panel.storage.insert(key, value);
+    Ok(())
+}
+
 /// Carries out one operation.
 ///
 /// The match is exhaustive on purpose: a new operation in the ABI must be decided here, not fall
@@ -325,10 +410,22 @@ fn queue_result(panel: &mut Panel, ctx: &HostCtx, id: &OpId, outcome: std::resul
 fn apply(panel: &mut Panel, ctx: &HostCtx, op: Operation) -> Result<()> {
     match op {
         // What the panel asks the UI to show.
-        Operation::UiView { view } => panel.view.view = Some(view),
+        Operation::UiView { view } => {
+            // `ui.click` and `ui.change` carry "every input's current value", and a value the view
+            // declares is as current as one set with `ui.set`. Seeding leaves an explicit value in
+            // place, so a panel that patched one field keeps it across a view declaring the rest.
+            for (key, value) in view::input_values(&view) {
+                if !panel.view.values.contains_key(&key) {
+                    // Best effort: a view that alone fills the cap still draws. The UI falls back to
+                    // the declared value for rendering, so the map is a convenience, not the source.
+                    let _ = insert_value(panel, key, value);
+                }
+            }
+            panel.view.view = Some(view);
+        }
         Operation::UiSet { values } => {
             for (key, value) in values {
-                panel.view.values.insert(key, value);
+                insert_value(panel, key, value)?;
             }
         }
         // `done` retires the bar rather than showing a full one.
@@ -346,21 +443,7 @@ fn apply(panel: &mut Panel, ctx: &HostCtx, op: Operation) -> Result<()> {
         Operation::TimerClear { id } => {
             panel.instance.timers_mut().clear(&id);
         }
-        Operation::StorageSet { key, value } => {
-            if value.is_null() {
-                // The ABI's delete (see `ops::Operation::StorageSet`). Without it a panel could only
-                // ever add keys, and its 256 would be a one-way door.
-                panel.storage.remove(&key);
-            } else {
-                if !panel.storage.contains_key(&key) && panel.storage.len() >= MAX_STORAGE_KEYS {
-                    return Err(err(PluginError::Limit(format!("a panel may keep {MAX_STORAGE_KEYS} stored values"))));
-                }
-                panel.storage.insert(key, value);
-            }
-            // Written through, so the next instance of this plug-in — a restart after a failure, or
-            // the panel reopened after `stop` — reads back what this one stored.
-            storages().insert(panel.instance.plugin().id().to_string(), panel.storage.clone());
-        }
+        Operation::StorageSet { key, value } => set_storage(panel, key, value)?,
         Operation::BlobFree { blob } => {
             panel.instance.blobs_mut().free(&blob);
         }
@@ -391,21 +474,81 @@ fn note_failure(id: &str, now: u64) -> bool {
     all.entry(id.to_string()).or_default().record(now)
 }
 
+/// The wall-clock budget of one host call that drives a panel, shared by every event that call pumps.
+///
+/// Each `pc_event` has its own deadline (`Limits::panel_wall_time_ms`), and a panel that answers each
+/// event just inside it could otherwise hold the process-wide panel lock for a minute or more: the
+/// queue is pumped up to [`MAX_PUMP_STEPS`] times, and `run_asked` repeats that up to
+/// [`MAX_PUMP_STEPS`] times again. One budget per host call bounds the whole of it.
+///
+/// Native builds only: the web build has no monotonic clock in `std` (see the module docs), so there
+/// [`Budget::expired`] is always false and fuel is the only bound.
+struct Budget {
+    #[cfg(not(target_arch = "wasm32"))]
+    at: std::time::Instant,
+}
+
+impl Budget {
+    fn after_ms(ms: u64) -> Budget {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ms;
+            Budget {}
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Budget { at: std::time::Instant::now() + std::time::Duration::from_millis(ms) }
+        }
+    }
+
+    /// The budget of one host call driving `panel`.
+    fn of(panel: &Panel) -> Budget {
+        Budget::after_ms(panel.instance.plugin().limits().panel_wall_time_ms)
+    }
+
+    fn expired(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::time::Instant::now() >= self.at
+        }
+    }
+}
+
+/// The budget of one host call driving `id`: the panel's own limit, or the default while it has no
+/// instance yet (a panel being opened).
+fn budget_for(id: &str) -> Budget {
+    match panels().get(id) {
+        Some(panel) => Budget::of(panel),
+        None => Budget::after_ms(photocraft_plugins::Limits::default().panel_wall_time_ms),
+    }
+}
+
 /// Sends one event and carries out everything the panel answers with, until it settles.
-fn drive(panel: &mut Panel, event: Value, ctx: &HostCtx) -> Result<()> {
+fn drive(panel: &mut Panel, event: Value, ctx: &HostCtx, budget: &Budget) -> Result<()> {
     panel.instance.queue_mut().push(event);
-    drain(panel, ctx)
+    drain(panel, ctx, budget)
 }
 
 /// Carries out what the panel has queued: send each event, apply the operations it answers with,
 /// and keep going while those operations queue events of their own.
-fn drain(panel: &mut Panel, ctx: &HostCtx) -> Result<()> {
+fn drain(panel: &mut Panel, ctx: &HostCtx, budget: &Budget) -> Result<()> {
     let mut pumped = 0usize;
     while let Some(event) = panel.instance.queue_mut().pop() {
         pumped += 1;
         if pumped > MAX_PUMP_STEPS {
             let error = PluginError::Failed(format!("the panel queued more than {MAX_PUMP_STEPS} events without settling"));
             panel.instance.stop(error.clone());
+            note_failure(panel.instance.plugin().id(), ctx.now);
+            return Err(err(error));
+        }
+        if budget.expired() {
+            let error = PluginError::Limit("time budget".into());
+            panel.instance.stop(error.clone());
+            note_failure(panel.instance.plugin().id(), ctx.now);
             return Err(err(error));
         }
         let ops = match panel.instance.send(&event) {
@@ -416,7 +559,14 @@ fn drain(panel: &mut Panel, ctx: &HostCtx) -> Result<()> {
             }
         };
         for op in ops {
-            apply(panel, ctx, op)?;
+            // The ABI says a bad operation rejects the batch and stops the panel. Returning the
+            // error alone would leave the operations before it applied, the ones after it dropped,
+            // and the panel still running with a state it never asked for.
+            if let Err(error) = apply(panel, ctx, op) {
+                panel.instance.stop(PluginError::Ops(error.to_string()));
+                note_failure(panel.instance.plugin().id(), ctx.now);
+                return Err(error);
+            }
         }
     }
     panel.steps += pumped as u64;
@@ -428,7 +578,7 @@ fn drain(panel: &mut Panel, ctx: &HostCtx) -> Result<()> {
 /// Called with the panel lock **not** held. A granted command is ordinary engine code: it may be
 /// slow, it may ask the panel something in turn, and it must never run underneath the panel lock —
 /// a command that touched a panel would otherwise wait for itself.
-fn run_asked(s: &mut Session, id: &str, ctx: &HostCtx) -> Result<()> {
+fn run_asked(s: &mut Session, id: &str, ctx: &HostCtx, budget: &Budget) -> Result<()> {
     for _ in 0..MAX_PUMP_STEPS {
         let asked = {
             let mut all = panels();
@@ -454,7 +604,7 @@ fn run_asked(s: &mut Session, id: &str, ctx: &HostCtx) -> Result<()> {
         for (op_id, outcome) in answers {
             queue_result(panel, ctx, &op_id, outcome);
         }
-        drain(panel, ctx)?;
+        drain(panel, ctx, budget)?;
     }
     // Asking for a command on every answer never settles: stop the panel, as a runaway event loop is
     // stopped, rather than run engine commands for it forever.
@@ -522,6 +672,7 @@ fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let plugin = panel_plugin(CMD, &id)?;
     let doc = active_doc(s, p);
     let ctx = HostCtx { now: now_ms(), doc: doc.as_ref() };
+    let budget = budget_for(&id);
     let caps = plugin.manifest().capabilities.clone();
     // The whole map work happens under the lock, and the panel is driven inside it; whatever it
     // asked for is run afterwards, with the lock down (see [`run_asked`]).
@@ -536,7 +687,7 @@ fn open(s: &mut Session, p: &Value) -> Result<Value> {
             // `init` carries what this plug-in stored in an earlier session, so a panel opens where it
             // left off rather than empty. The instance is seeded from the same map (see [`Panel::new`]).
             let init = ops::init(ctx.now, host_info(), LOCALE, &panel.storage, &entropy(), &grants(&caps));
-            drive(&mut panel, init, &ctx)?;
+            drive(&mut panel, init, &ctx, &budget)?;
             // A panel is told about a document only once it has changed, so the one it opened against is
             // not announced as news.
             panel.seen = s.active().map(|d| (d.doc.id.0, d.revision));
@@ -547,10 +698,10 @@ fn open(s: &mut Session, p: &Value) -> Result<Value> {
             }
             panel.visible = true;
             let event = ops::panel_visible(ctx.now, true);
-            drive(panel, event, &ctx)?;
+            drive(panel, event, &ctx, &budget)?;
         }
     }
-    run_asked(s, &id, &ctx)?;
+    run_asked(s, &id, &ctx, &budget)?;
     let all = panels();
     Ok(all.get(&id).map(inspect_panel).unwrap_or(Value::Null))
 }
@@ -566,6 +717,7 @@ fn close(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let doc = active_doc(s, p);
     let ctx = HostCtx { now: now_ms(), doc: doc.as_ref() };
+    let budget = budget_for(&id);
     {
         let mut all = panels();
         let Some(panel) = all.get_mut(&id) else {
@@ -574,10 +726,10 @@ fn close(s: &mut Session, p: &Value) -> Result<Value> {
         panel.visible = false;
         if panel.stopped().is_none() {
             let event = ops::panel_visible(ctx.now, false);
-            drive(panel, event, &ctx)?;
+            drive(panel, event, &ctx, &budget)?;
         }
     }
-    run_asked(s, &id, &ctx)?;
+    run_asked(s, &id, &ctx, &budget)?;
     Ok(json!({"id": id, "visible": false, "open": true}))
 }
 
@@ -600,22 +752,31 @@ fn event(s: &mut Session, p: &Value) -> Result<Value> {
     let widget = |kind: &str| event.get("id").and_then(Value::as_str).ok_or_else(|| bad(CMD, format!("`{kind}` needs a widget `id`")));
     let doc = active_doc(s, p);
     let ctx = HostCtx { now: now_ms(), doc: doc.as_ref() };
+    let budget = budget_for(&id);
     {
         let mut all = panels();
         let panel = all.get_mut(&id).ok_or_else(|| EngineError::Other(format!("plug-in {id:?} has no open panel (see plugin.panel.open)")))?;
         if let Some(reason) = panel.stopped() {
             return Err(EngineError::Other(format!("plug-in {id:?} is stopped ({reason}); start it again with plugin.panel.restart")));
         }
-        let values = panel.view.values.clone();
         let event = match kind {
-            "ui.click" => ops::ui_click(ctx.now, widget("ui.click")?, event.get("value").unwrap_or(&Value::Null), &values),
-            "ui.change" => ops::ui_change(ctx.now, widget("ui.change")?, event.get("value").unwrap_or(&Value::Null), &values),
+            "ui.click" => ops::ui_click(ctx.now, widget("ui.click")?, event.get("value").unwrap_or(&Value::Null), &panel.view.values),
+            "ui.change" => {
+                // The committed value is the input's current value from now on: this event's own
+                // `values` and the next click carry what the user typed, not what was there before.
+                // A value past the cap is still delivered to the panel; only the map stays capped.
+                if let Some(w) = event.get("id").and_then(Value::as_str) {
+                    let value = event.get("value").cloned().unwrap_or(Value::Null);
+                    let _ = insert_value(panel, w.to_string(), value);
+                }
+                ops::ui_change(ctx.now, widget("ui.change")?, event.get("value").unwrap_or(&Value::Null), &panel.view.values)
+            }
             "cancel" => ops::cancel(ctx.now),
             other => return Err(bad(CMD, format!("`{other}` is not a panel event (`ui.click`, `ui.change` or `cancel`)"))),
         };
-        drive(panel, event, &ctx)?;
+        drive(panel, event, &ctx, &budget)?;
     }
-    run_asked(s, &id, &ctx)?;
+    run_asked(s, &id, &ctx, &budget)?;
     let all = panels();
     let panel = all.get(&id).ok_or_else(|| EngineError::Other(format!("plug-in {id:?} has no open panel (see plugin.panel.open)")))?;
     Ok(inspect_panel(panel))
@@ -649,11 +810,13 @@ fn tick(s: &mut Session, p: &Value) -> Result<Value> {
             if only.is_some_and(|want| want != id) || panel.stopped().is_some() {
                 continue;
             }
+            // One budget for this panel's whole turn: its timers and the change notice together.
+            let budget = Budget::of(panel);
             for timer in panel.instance.timers_mut().take_due(ctx.now) {
                 fired += 1;
                 // A timer fires as the `result` of the operation that armed it.
                 let event = ops::result(ctx.now, &OpId::Text(timer), true, json!({}));
-                if let Err(e) = drive(panel, event, &ctx) {
+                if let Err(e) = drive(panel, event, &ctx, &budget) {
                     errors.push(json!({"id": id, "error": e.to_string()}));
                     break;
                 }
@@ -664,8 +827,16 @@ fn tick(s: &mut Session, p: &Value) -> Result<Value> {
             let seen = doc_id.map(|d| (d, revision));
             if seen != panel.seen {
                 panel.seen = seen;
-                let event = ops::doc_changed(ctx.now, doc.as_ref().unwrap_or(&Value::Null), revision);
-                if let Err(e) = drive(panel, event, &ctx) {
+                // Reading the document is a capability, and `doc.info` refuses without it: the change
+                // signal must not hand one panel what the other is denied. A panel without `read` is
+                // still told *that* the document changed (and to which revision) — it just gets no
+                // contents, exactly as if it asked `doc.info` itself.
+                let body = match panel.granted(DocumentCap::Read) {
+                    Ok(()) => doc.as_ref().unwrap_or(&Value::Null),
+                    Err(_) => &Value::Null,
+                };
+                let event = ops::doc_changed(ctx.now, body, revision);
+                if let Err(e) = drive(panel, event, &ctx, &budget) {
                     errors.push(json!({"id": id, "error": e.to_string()}));
                 }
             }
@@ -676,7 +847,8 @@ fn tick(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // A command a panel asked for while being ticked runs with the lock down, as everywhere else.
     for id in asked_ids {
-        if let Err(e) = run_asked(s, &id, &ctx) {
+        let budget = budget_for(&id);
+        if let Err(e) = run_asked(s, &id, &ctx, &budget) {
             errors.push(json!({"id": id, "error": e.to_string()}));
         }
     }
@@ -695,13 +867,14 @@ fn restart(s: &mut Session, p: &Value) -> Result<Value> {
     failures().remove(&id);
     let mut panel = Panel::new(plugin)?;
     panel.visible = true;
+    let budget = Budget::of(&panel);
     // A restart is the same plug-in starting again, so it gets its storage back — which for a panel
     // that failed mid-edit is the difference between picking up and starting over.
     let init = ops::init(ctx.now, host_info(), LOCALE, &panel.storage, &entropy(), &grants(&caps));
-    drive(&mut panel, init, &ctx)?;
+    drive(&mut panel, init, &ctx, &budget)?;
     panel.seen = s.active().map(|d| (d.doc.id.0, d.revision));
     panels().insert(id.clone(), panel);
-    run_asked(s, &id, &ctx)?;
+    run_asked(s, &id, &ctx, &budget)?;
     let all = panels();
     Ok(all.get(&id).map(inspect_panel).unwrap_or(Value::Null))
 }

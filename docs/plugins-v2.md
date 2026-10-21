@@ -127,8 +127,8 @@ may carry several operations, and they are applied in order.
 |---|---|---|
 | `init` | `{"type":"init","now":…,"host":{…},"locale":"en-US","storage":{…},"entropy":"<hex>","grants":{…}}` | Once, when the instance starts. `host` is `{"name":"PhotoCraft","version":…,"build":…,"platform":…,"arch":…,"widgets":[…]}`; `widgets` lists the newer widget features this host draws (`list`, `scroll`, `label.color`, `label.font`, `button.icon`), so a panel built once can fall back to a plain layout on a host that lacks one. `storage` is everything this plug-in stored in earlier sessions; `entropy` is 32 bytes of hex from the clock and a counter, for seeding a PRNG; `grants` is `{"storage": <declared>, "document": […], "network": null, "commands": […]}` — what the host actually allows, where `commands` is the engine commands this panel may ask for with `doc.command` (empty when the manifest asks for no document capability). |
 | `panel.visible` | `{"type":"panel.visible","now":…,"visible":bool}` | The panel was shown or hidden. A plug-in may pause polling while hidden. |
-| `doc.changed` | `{"type":"doc.changed","now":…,"doc":<document or null>,"revision":n}` | The active document changed (id or revision), or was closed (`doc` is `null`), since the panel last heard. Sent from `plugin.panel.tick`. |
-| `ui.click` | `{"type":"ui.click","now":…,"id":"<widget>","values":{…}}` | A widget was pressed. `values` is every input's current value. A `list` row adds `"value": <row index>`; other widgets send no `value`. |
+| `doc.changed` | `{"type":"doc.changed","now":…,"doc":<document or null>,"revision":n}` | The active document changed (id or revision), or was closed (`doc` is `null`), since the panel last heard. Sent from `plugin.panel.tick`. The document is carried in full only when the manifest asks for the `read` capability; without it `revision` still says a change happened, and `doc` is `null` — a capability is not granted by an event that merely arrives. |
+| `ui.click` | `{"type":"ui.click","now":…,"id":"<widget>","values":{…}}` | A widget was pressed. `values` is every input's current value: what `ui.set` last set or the UI committed, plus the values the view declares for inputs the plug-in has not set itself. A `list` row adds `"value": <row index>`; other widgets send no `value`. |
 | `ui.change` | `{"type":"ui.change","now":…,"id":"<widget>","value":…,"values":{…}}` | An input was committed: Enter, focus lost, slider released, choice picked. Not sent per keystroke. |
 | `result` | `{"type":"result","now":…,"id":…,"ok":bool, …fields}` | An operation that carried an `id` finished, or a timer came due. On success the operation's fields are merged in; on failure the event carries `"error": "<message>"`. |
 | `cancel` | `{"type":"cancel","now":…}` | The user pressed Cancel on the panel's progress bar. |
@@ -159,16 +159,16 @@ silence.
 |---|---|---|
 | `ui.view` | `{"op":"ui.view","view":<widget>}` | Draw this widget tree; it replaces the previous one. A bad view rejects the whole reply and stops the panel. No `result`. |
 | `ui.set` | `{"op":"ui.set","values":{"<id>":<value>,…}}` | Change input values without replacing the view. Keys must be widget ids. Values win over the `value` a widget declared. No `result`. |
-| `ui.progress` | `{"op":"ui.progress","fraction":0..1|null,"text":"…","cancellable":bool,"done":bool}` | The panel's progress bar. `fraction: null` is indeterminate. `done: true` retires the bar. `text` ≤ 4000 characters. No `result`. |
+| `ui.progress` | `{"op":"ui.progress","fraction":0..1\|null,"text":"…","cancellable":bool,"done":bool}` | The panel's progress bar. `fraction: null` is indeterminate. `done: true` retires the bar. `text` ≤ 4000 characters. No `result`. |
 | `ui.notice` | `{"op":"ui.notice","level":"info"\|"warning"\|"error","text":"…"}` | A host notice shown under the panel's view. `text` must be non-empty and ≤ 4000 characters. The host keeps the last 32. No `result`. |
 | `timer.set` | `{"op":"timer.set","id":"<name>","ms":n}` | Fires a `result` event `n` ms from now. `ms` in `16..=600000`. Re-arming an armed id moves it and does not count as a new timer. |
 | `timer.clear` | `{"op":"timer.clear","id":"<name>"}` | Disarms a timer. No `result`. |
 | `storage.set` | `{"op":"storage.set","key":"<name>","value":<any JSON>}` | Writes to the plug-in's own store; a `null` value deletes the key. No `result`. |
 | `doc.info` | `{"op":"doc.info","id":…}` | Answers `result` with the active document (or the one named by the command's `doc` parameter) merged into the event. With no document open, `ok: false` and `"error": "no document is open"`. |
 | `doc.command` | `{"op":"doc.command","id":…,"command":"type.create","params":{…}}` | Runs an engine command and answers `result` with what it returned. Only the commands in `init.grants.commands` are run; the rest are refused with the reason. |
-| `doc.capture` | `{"op":"doc.capture","id":…,"source":…,"rect":…,"alpha":…,"maxSide":…,"bits":…}` | Refused in this build: `result` with `ok: false`, `"error": "this host does not capture pixels yet: `doc.capture` was not carried out"`. |
-| `doc.commit` | `{"op":"doc.commit","id":…,"doc":n,"label":"…","layers":[…],"ifRevision":…}` | Refused in this build: `result` with `ok: false`, `"error": "this host does not add layers yet: `doc.commit` was not carried out"`. |
-| `http.request` | `{"op":"http.request","id":…,"method":…,"url":…,"headers":{…},"body":…,"response":…,"timeoutMs":…}` | Refused in this build: `result` with `ok: false`, `"error": "this host makes no network requests: `http.request` was not carried out"`. |
+| `doc.capture` | `{"op":"doc.capture","id":…,"source":…,"rect":…,"alpha":…,"maxSide":…,"bits":…}` | Refused in this build: `result` with `ok: false`, ``"error": "this host does not capture pixels yet: `doc.capture` was not carried out"``. |
+| `doc.commit` | `{"op":"doc.commit","id":…,"doc":n,"label":"…","layers":[…],"ifRevision":…}` | Refused in this build: `result` with `ok: false`, ``"error": "this host does not add layers yet: `doc.commit` was not carried out"``. |
+| `http.request` | `{"op":"http.request","id":…,"method":…,"url":…,"headers":{…},"body":…,"response":…,"timeoutMs":…}` | Refused in this build: `result` with `ok: false`, ``"error": "this host makes no network requests: `http.request` was not carried out"``. |
 | `blob.free` | `{"op":"blob.free","blob":"b:1"}` | Releases a blob. Idempotent: an unknown id is not an error. No `result`. |
 
 ### `doc.command`
@@ -373,8 +373,8 @@ Storage belongs to the **plug-in**, not to a run of it: a panel that lost its se
 restarted, or hidden and shown again, would have nowhere to keep anything. `storage.set` writes a
 value (any JSON value) under a key; a `null` value **deletes** the key, which is the store's only way
 to shrink — without it a panel that reached its key limit could never make room. A plug-in may keep
-at most 256 keys, and the store is read back in `init`, so a panel opens where it left off rather
-than empty and a restart after a failure gets the same store.
+at most 256 keys and 1 MiB of values (each counted as JSON), and the store is read back in `init`, so
+a panel opens where it left off rather than empty and a restart after a failure gets the same store.
 
 Today the store lives **in memory only**, in a process-wide map keyed by plug-in id: it survives
 closing, hiding and restarting the panel, and it is forgotten when the plug-in is removed
@@ -395,9 +395,10 @@ Limits (`photocraft_plugins::Limits`, defaults):
 | Module size | 32 MiB | rejected |
 | Linear memory | 512 MiB per instance | `memory.grow` returns -1; oversized initial memory fails |
 | Instructions (fuel) | 50 M per call, on `pc_event`, `pc_alloc` and `pc_free` alike | `Limit("instruction budget")` |
-| Wall clock per `pc_event` | 2 s (`panel_wall_time_ms`; native builds only — the web build has no monotonic clock in `std` and is bounded by fuel alone) | `Limit("time budget")` |
+| Wall clock per host call | 2 s (`panel_wall_time_ms`), shared by every event that call pumps rather than granted afresh to each (native builds only — the web build has no monotonic clock in `std` and is bounded by fuel alone) | `Limit("time budget")`; the panel is stopped |
 | Call depth | 1,024 frames | trap |
 | Event and reply size | 1 MiB each, and at most 64 operations per reply | `Limit` |
+| Input values (`ui.set` and what views declare) | 512 keys, 4 MiB as JSON | `Limit`; the panel is stopped |
 | Timers | 32 pending, `16..=600000` ms | `Limit` |
 | Notices kept | 32, each ≤ 4000 characters | older ones dropped |
 | Events queued | 1 024 | the oldest `ui.*` event is dropped first |
@@ -411,18 +412,23 @@ refuses with "failed repeatedly; start it again with `plugin.panel.restart`", an
 `plugin.panel.restart` (which clears the window) starts it again.
 
 **Failure behaviour.** Any failure — a trap, an exhausted budget, an unparsable or invalid reply, a
-bad pointer — stops the instance: its queue, timers and blobs are dropped and it stays stopped,
-reporting the same reason on every later event until restarted. Nothing a panel does touches the
-document: the only operations that would change it are refused in this build, so a failed panel
+bad pointer, an operation that passed validation but cannot be carried out (a store or value map over
+its cap) — stops the instance and counts towards the failure window. A reply is validated whole
+before any of it is applied; an operation that fails while being carried out stops the panel partway
+through that reply instead, so what came before it stands and the panel is stopped rather than left
+running on the rest of a batch it cannot see. Its queue, timers and blobs are dropped and it stays
+stopped, reporting the same reason on every later event until restarted. Nothing a panel does touches
+the document: the only operations that would change it are refused in this build, so a failed panel
 leaves the document exactly as it was. The user sees the panel's window replaced by "This plug-in
 stopped.", the reason, and a **Restart Plug-in** button.
 
 **Panels are process-wide.** There is one instance per plug-in id for the whole process, shared by
 every session (the installed plug-ins and the failure windows are process-wide too, as in v1). The
 host drives an instance under one process-wide lock on the calling thread, so a hostile panel is
-bounded by the 2 s budget of a single event and is then stopped for good; it can delay other panels
-by at most that. `plugin.panel.tick` announces the active document of whichever session called it,
-and the UI calls it once a frame.
+bounded by one 2 s wall-clock budget per host call — shared by every event that call pumps, not
+granted afresh to each — and is then stopped for good; it can delay other panels by at most that.
+`plugin.panel.tick` announces the active document of whichever session called it, and the UI calls it
+once a frame, and asks for a frame when the nearest timer of a visible panel is due.
 
 ## Host commands
 

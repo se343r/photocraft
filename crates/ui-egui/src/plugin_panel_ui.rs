@@ -122,6 +122,12 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     // where a panel failing every frame would repeat itself sixty times a second. It also goes through
     // `run_background`: a frame-by-frame command must not clear what the user is being told.
     let _ = app.run_background("plugin.panel.tick", json!({}));
+    // Timers are the one thing a panel asks for that happens without the user. The tick above fired
+    // the ones already due, so this asks for a frame when the nearest remaining one is — and at most
+    // ~60 frames a second, so a panel that re-arms a zero timer cannot spin the editor.
+    if let Some(ms) = photocraft_engine::plugin_panel_cmds::next_timer_in() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(ms.clamp(16, 60_000)));
+    }
     let t = Tokens::get(ctx);
     let canvas = app.last_canvas_rect;
     let panels = photocraft_engine::plugin_panel_cmds::draw_list();
