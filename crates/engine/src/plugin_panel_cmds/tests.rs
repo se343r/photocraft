@@ -59,6 +59,12 @@ const VIEW: &str = r#"[{"op": "ui.view", "view": {"type": "column", "children": 
     {"type": "text", "id": "script", "value": "", "multiline": true},
     {"type": "button", "id": "go", "label": "Go", "primary": true}]}}]"#;
 
+/// A view whose inputs declare values: what `values` must carry before anything is set or typed.
+const VIEW_WITH_VALUES: &str = r#"[{"op": "ui.view", "view": {"type": "column", "children": [
+    {"type": "text", "id": "script", "value": "declared line", "multiline": true},
+    {"type": "toggle", "id": "bold", "value": true, "label": "Bold"},
+    {"type": "button", "id": "go", "label": "Go", "primary": true}]}}]"#;
+
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
@@ -112,7 +118,7 @@ fn panel_with(manifest: &str, replies: &[&str]) -> Vec<u8> {
     // The first reply is the view the panel sends on `init`, and it is also what a tick is answered
     // with (see [`tick_guard`]) — so it is not one of the scripted answers below, and it is never a
     // trap.
-    assert_eq!(replies.first(), Some(&VIEW), "a fixture's script starts with the view its panel sends");
+    assert!(replies.first().is_some_and(|r| r.contains("ui.view")), "a fixture's script starts with the view its panel sends");
     let mut data = String::new();
     for (i, reply) in replies.iter().enumerate() {
         if *reply != TRAP {
@@ -145,6 +151,24 @@ fn panel_manifest(id: &str) -> String {
             "panel":{{"title":"{id}","minWidth":200}},
             "capabilities":{{"document":["read","addLayers"],"storage":true}}}}"#
     )
+}
+
+/// A panel that asks for no document capability at all: it may keep a store and nothing else.
+fn closed_manifest(id: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","name":"Panel {id}","version":"2.0","kind":"panel",
+            "panel":{{"title":"{id}","minWidth":200}},
+            "capabilities":{{"storage":true}}}}"#
+    )
+}
+
+/// A fixture that echoes **every** event back into its store, `doc.changed` included — unlike
+/// [`panel`], whose script answers a tick with its view so a test can read the events it sent.
+/// A test using one holds [`ticking`], so no other test's tick writes into the same store.
+fn echoing_panel(manifest: &str) -> Vec<u8> {
+    let mut data = format!("(data (i32.const {ECHO_AT}) \"{}\")\n", escape(ECHO_PREFIX));
+    data.push_str(&format!("(data (i32.const {SUFFIX_AT}) \"{}\")\n", escape(ECHO_SUFFIX)));
+    module_with(manifest, &echo_body(), &data)
 }
 
 /// A panel that answers every event with the same reply, forever.
@@ -341,6 +365,50 @@ fn a_click_reaches_the_panel_and_its_operations_are_carried_out() {
     cleanup(&mut s, id);
 }
 
+#[test]
+fn a_click_carries_the_values_the_view_declares() {
+    let _tick = ticking();
+    let id = "test.panel.declaredvalues";
+    let mut s = app(id, &panel_with(&panel_manifest(id), &[VIEW_WITH_VALUES]));
+    open(&mut s, id);
+    click(&mut s, id, "go").unwrap();
+    let event = last_event(&mut s, id);
+    assert_eq!(event["type"], "ui.click", "{event}");
+    assert_eq!(event["values"]["script"], "declared line", "`values` is every input's current value: {event}");
+    assert_eq!(event["values"]["bold"], true);
+    cleanup(&mut s, id);
+}
+
+#[test]
+fn a_committed_change_is_the_value_the_next_click_carries() {
+    let _tick = ticking();
+    let id = "test.panel.change";
+    let mut s = app(id, &panel_with(&panel_manifest(id), &[VIEW_WITH_VALUES]));
+    open(&mut s, id);
+    s.execute("plugin.panel.event", json!({"id": id, "event": {"type": "ui.change", "id": "script", "value": "typed"}})).unwrap();
+    click(&mut s, id, "go").unwrap();
+    let event = last_event(&mut s, id);
+    assert_eq!(event["type"], "ui.click", "{event}");
+    assert_eq!(event["values"]["script"], "typed", "what the user typed is the input's current value: {event}");
+    cleanup(&mut s, id);
+}
+
+#[test]
+fn input_values_are_capped_and_a_panel_that_overflows_them_is_stopped() {
+    let id = "test.panel.valuecap";
+    // One `ui.set` with more keys than the host keeps: the operation is refused, the batch with it.
+    let keys: Vec<String> = (0..=MAX_VALUE_KEYS).map(|i| format!(r#""k{i}": {i}"#)).collect();
+    let reply = format!(r#"[{{"op": "ui.set", "values": {{{}}}}}]"#, keys.join(","));
+    let mut s = app(id, &panel(id, &[VIEW, &reply]));
+    open(&mut s, id);
+    let error = click(&mut s, id, "go").expect_err("a panel may keep only so many input values");
+    assert!(error.to_string().contains("input values"), "{error}");
+    let st = inspect(&mut s, id);
+    assert_eq!(st["state"], "stopped", "{st}");
+    assert_eq!(st["values"].as_object().map(serde_json::Map::len), Some(MAX_VALUE_KEYS), "nothing past the cap was kept: {st}");
+    cleanup(&mut s, id);
+}
+
 /// Another session's tick must not eat this panel's answers.
 ///
 /// Panels are process-wide and `tick` announces the *calling* session's document to all of them, so a
@@ -373,6 +441,38 @@ fn another_sessions_tick_does_not_eat_a_panels_answers() {
     assert_eq!(answer["id"], "d1");
     assert_eq!(answer["ok"], true, "{answer}");
     assert_eq!(answer["width"], 40, "and `doc.info` read the panel's own session's document: {answer}");
+    cleanup(&mut s, id);
+}
+
+#[test]
+fn a_panel_without_read_is_told_the_document_changed_without_its_contents() {
+    let _tick = ticking();
+    let id = "test.panel.docchanged.noread";
+    let mut s = app(id, &echoing_panel(&closed_manifest(id)));
+    open(&mut s, id);
+    // A second document is a new active one, which the tick announces. The panel asked for no
+    // `read` grant, and `doc.changed` must not hand it what `doc.info` would refuse.
+    s.execute("file.new", json!({"width": 40, "height": 28})).unwrap();
+    s.execute("plugin.panel.tick", json!({"id": id})).unwrap();
+    let event = last_event(&mut s, id);
+    assert_eq!(event["type"], "doc.changed", "{event}");
+    assert!(event["doc"].is_null(), "no read grant, no document contents: {event}");
+    assert!(event["revision"].as_u64().is_some_and(|r| r > 0), "the change *is* announced: {event}");
+    cleanup(&mut s, id);
+}
+
+#[test]
+fn a_panel_with_read_is_told_the_document_changed_with_its_contents() {
+    let _tick = ticking();
+    let id = "test.panel.docchanged.read";
+    let mut s = app(id, &echoing_panel(&panel_manifest(id)));
+    open(&mut s, id);
+    s.execute("file.new", json!({"width": 40, "height": 28})).unwrap();
+    s.execute("plugin.panel.tick", json!({"id": id})).unwrap();
+    let event = last_event(&mut s, id);
+    assert_eq!(event["type"], "doc.changed", "{event}");
+    assert_eq!(event["doc"]["width"], 40, "a granted read gets the document, as `doc.info` does: {event}");
+    assert_eq!(event["doc"]["height"], 28);
     cleanup(&mut s, id);
 }
 
@@ -442,6 +542,47 @@ fn doc_info_answers_with_the_open_document() {
     assert_eq!(answer["width"], 40);
     assert_eq!(answer["height"], 28);
     assert_eq!(answer["layers"].as_array().map(Vec::len), Some(1));
+    cleanup(&mut s, id);
+}
+
+#[test]
+fn a_bad_operation_stops_the_panel_instead_of_leaving_half_the_batch_applied() {
+    let id = "test.panel.badop";
+    // The 33rd `timer.set` is one past the limit: the operations before it are carried out, this one
+    // is not. The ABI says the batch is rejected and the panel stopped, so nothing it armed survives.
+    let ops: Vec<String> = (0..=photocraft_plugins::instance::MAX_TIMERS).map(|i| format!(r#"{{"op": "timer.set", "id": "t{i}", "ms": 100}}"#)).collect();
+    let reply = format!("[{}]", ops.join(","));
+    let mut s = app(id, &panel(id, &[VIEW, &reply]));
+    open(&mut s, id);
+    let error = click(&mut s, id, "go").expect_err("a reply with too many timers must fail");
+    assert!(error.to_string().contains("timers"), "{error}");
+    let st = inspect(&mut s, id);
+    assert_eq!(st["state"], "stopped", "{st}");
+    assert!(st["error"].as_str().unwrap_or_default().contains("timers"), "{st}");
+    assert_eq!(st["timers"], 0, "the timers the earlier operations armed went with the instance: {st}");
+    // And it stays stopped, as for any other failure.
+    assert!(click(&mut s, id, "go").is_err());
+    cleanup(&mut s, id);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn one_host_call_gets_one_wall_clock_budget_not_one_per_event() {
+    // The web build has no monotonic clock in `std`, so there is nothing to expire; fuel bounds it.
+    let id = "test.panel.budget";
+    let mut s = app(id, &panel(id, &[VIEW]));
+    open(&mut s, id);
+    // A budget that has already run out stops the panel instead of pumping it event by event, each
+    // with a fresh 2 s deadline of its own.
+    {
+        let mut all = panels();
+        let panel = all.get_mut(id).expect("the panel was just opened");
+        let ctx = HostCtx { now: now_ms(), doc: None };
+        let error = drive(panel, ops::panel_visible(ctx.now, true), &ctx, &Budget::after_ms(0)).expect_err("an expired budget must stop the panel");
+        assert!(error.to_string().contains("time budget"), "{error}");
+        assert!(panel.stopped().is_some());
+    }
+    assert_eq!(inspect(&mut s, id)["state"], "stopped");
     cleanup(&mut s, id);
 }
 
@@ -717,4 +858,46 @@ fn a_panel_is_told_which_widgets_this_host_draws() {
         assert!(widgets.iter().any(|w| w == wanted), "{wanted:?} missing from {widgets:?}");
     }
     assert_eq!(host["name"], "PhotoCraft");
+}
+
+#[test]
+fn the_store_is_capped_at_one_mib_and_a_refused_value_is_not_kept() {
+    let id = "test.panel.storagecap";
+    let mut s = app(id, &panel(id, &[VIEW]));
+    open(&mut s, id);
+    let ctx = HostCtx { now: now_ms(), doc: None };
+    {
+        let mut all = panels();
+        let panel = all.get_mut(id).unwrap();
+        // Each value is under the 1 MiB reply cap, so the store's own cap is what refuses the second.
+        let big = "x".repeat(600 * 1024);
+        apply(panel, &ctx, Operation::StorageSet { key: "a".into(), value: Value::String(big.clone()) }).unwrap();
+        let e = apply(panel, &ctx, Operation::StorageSet { key: "b".into(), value: Value::String(big) }).unwrap_err();
+        assert!(e.to_string().contains("stored values"), "{e}");
+        assert_eq!(panel.storage.len(), 1, "the refused value was not kept");
+        assert_eq!(storages().get(id).map(Map::len), Some(1), "and the written-through store matches");
+        // Replacing a key is measured by the difference, not by the sum of old and new.
+        apply(panel, &ctx, Operation::StorageSet { key: "a".into(), value: Value::String("small".into()) }).unwrap();
+        assert_eq!(storages().get(id).unwrap().get("a"), Some(&json!("small")));
+        apply(panel, &ctx, Operation::StorageSet { key: "a".into(), value: Value::Null }).unwrap();
+        assert!(panel.storage.is_empty());
+        assert!(storages().get(id).is_none_or(|m| !m.contains_key("a")), "a delete reaches the store too");
+    }
+    cleanup(&mut s, id);
+}
+
+#[test]
+fn an_armed_timer_tells_the_ui_when_to_draw_again() {
+    let _ticking = ticking();
+    let id = "test.panel.nexttimer";
+    let mut s = app(id, &panel(id, &[VIEW, r#"[{"op": "timer.set", "id": "poll", "ms": 60000}]"#]));
+    open(&mut s, id);
+    assert_eq!(next_timer_in(), None, "no timer is armed, so there is nothing to wake for");
+    click(&mut s, id, "go").unwrap();
+    let wait = next_timer_in().expect("a visible panel armed a timer");
+    assert!(wait <= 60_000, "the nearest timer is 60 s away, not {wait} ms");
+    // A closed panel has no window to repaint for: its timers wait until it is shown again.
+    s.execute("plugin.panel.close", json!({"id": id})).unwrap();
+    assert_eq!(next_timer_in(), None);
+    cleanup(&mut s, id);
 }

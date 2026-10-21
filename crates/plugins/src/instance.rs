@@ -105,6 +105,11 @@ impl Timers {
     pub fn clear_all(&mut self) {
         self.due.clear();
     }
+    /// Milliseconds until the next timer is due, for a host that repaints when one is; `None` when
+    /// none is armed. A timer already due gives `0`.
+    pub fn next_due_in(&self, now: u64) -> Option<u64> {
+        self.due.values().map(|at| at.saturating_sub(now)).min()
+    }
 }
 
 /// The failure window: three failures inside a minute stop automatic recovery.
@@ -303,6 +308,16 @@ mod tests {
         assert!(matches!(t.set("one-too-many", 10, 0), Err(Error::Limit(_))));
         assert!(t.clear("t0"));
         assert!(!t.clear("t0"));
+
+        // What a host that repaints when a timer is due asks: the nearest one, and none when idle.
+        let mut t = Timers::default();
+        assert_eq!(t.next_due_in(0), None);
+        t.set("soon", 50, 1_000).unwrap();
+        t.set("late", 500, 1_000).unwrap();
+        assert_eq!(t.next_due_in(1_000), Some(50));
+        assert_eq!(t.next_due_in(1_040), Some(10));
+        assert_eq!(t.next_due_in(1_050), Some(0), "a due timer is not a negative wait");
+        assert_eq!(t.next_due_in(9_999), Some(0));
     }
 
     #[test]

@@ -156,7 +156,7 @@ what an agent can't finish alone.
   Window › Plug-ins. It runs in the same wasmi sandbox with **no host imports**: everything crosses one
   `pc_event` entry point. A panel **acts** through `doc.command` — an engine command run from a short,
   reviewed allow-list in the host, gated again by the capability its manifest declares (`read` /
-  `addLayers`); the list is type and layer alignment, and nothing that reaches the file system, the
+  `addLayers`); the list is five type commands, and nothing that reaches the file system, the
   settings, the plug-in registry or a recorded action (AUTO-219-6 partial).
 - **Proof it is enough (2026-10-16):** the ABI has been taken to the far end of what it was designed
   for — a clean-room port of TyperTools 1.4.9's manga and comic lettering workflow, about 6,500 lines

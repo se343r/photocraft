@@ -212,20 +212,34 @@ pub(crate) fn sync_prefs(s: &Session) {
     if last.as_ref().is_some_and(|(f, _)| f == folder) {
         return;
     }
-    *last = Some((folder.to_string(), load_folder(folder)));
+    let (report, loaded) = load_folder(folder);
+    stop_replaced(&loaded);
+    *last = Some((folder.to_string(), report));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn load_folder(folder: &str) -> Value {
+fn load_folder(folder: &str) -> (Value, Vec<String>) {
     match registry::load_folder(std::path::Path::new(folder)) {
-        Ok(r) => json!({"folder": folder, "loaded": r.loaded, "failed": r.failed.iter().map(|(f, e)| json!({"file": f, "error": e})).collect::<Vec<_>>()}),
-        Err(e) => json!({"folder": folder, "error": e.to_string()}),
+        Ok(r) => (
+            json!({"folder": folder, "loaded": r.loaded, "failed": r.failed.iter().map(|(f, e)| json!({"file": f, "error": e})).collect::<Vec<_>>()}),
+            r.loaded,
+        ),
+        Err(e) => (json!({"folder": folder, "error": e.to_string()}), Vec::new()),
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_folder(folder: &str) -> Value {
-    json!({"folder": folder, "error": "plug-in folders are not available on the web"})
+fn load_folder(folder: &str) -> (Value, Vec<String>) {
+    (json!({"folder": folder, "error": "plug-in folders are not available on the web"}), Vec::new())
+}
+
+/// Ends the running instance of every plug-in a folder load has just replaced: a panel started the
+/// old module, and its code is gone. What the plug-in stored is kept — an upgrade is not a removal
+/// (see [`crate::plugin_panel_cmds::stop_all`]).
+fn stop_replaced(loaded: &[String]) {
+    for id in loaded {
+        crate::plugin_panel_cmds::stop_all(id);
+    }
 }
 
 fn reload(s: &mut Session, p: &Value) -> Result<Value> {
@@ -236,10 +250,11 @@ fn reload(s: &mut Session, p: &Value) -> Result<Value> {
     if folder.is_empty() {
         return Err(bad("plugin.reload", "no folder: pass `path` or set Preferences › Plug-ins › Additional Plug-ins Folder"));
     }
-    let report = load_folder(&folder);
+    let (report, loaded) = load_folder(&folder);
     if let Some(e) = report.get("error").and_then(Value::as_str) {
         return Err(EngineError::Other(e.to_string()));
     }
+    stop_replaced(&loaded);
     *FOLDER.lock().unwrap_or_else(|e| e.into_inner()) = Some((folder, report.clone()));
     Ok(report)
 }

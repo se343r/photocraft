@@ -4,7 +4,7 @@
 //! choose a colour, font or size, so every panel is on-theme in light and dark for free, and the
 //! tree stays readable through `ui.inspect`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -230,6 +230,49 @@ pub fn valid_id(id: &str) -> bool {
 /// panel body's own scroll area, so its panes can share that height and scroll independently.
 pub fn has_scroll(root: &Widget) -> bool {
     matches!(root, Widget::Scroll { .. }) || root.children().iter().any(has_scroll)
+}
+
+/// The values a view declares for its inputs, in id order.
+///
+/// `ui.click` and `ui.change` promise "every input's current value"; a panel that declares a field's
+/// value in `ui.view` rather than setting it with `ui.set` has still said what that value is.
+pub fn input_values(root: &Widget) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
+    collect_values(root, 0, &mut out);
+    out
+}
+
+fn collect_values(w: &Widget, depth: usize, out: &mut BTreeMap<String, serde_json::Value>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    match w {
+        Widget::Text { id, value, .. } => {
+            out.insert(id.clone(), serde_json::Value::String(value.clone()));
+        }
+        Widget::Number { id, value, .. } => {
+            if let Some(n) = serde_json::Number::from_f64(*value) {
+                out.insert(id.clone(), serde_json::Value::Number(n));
+            }
+        }
+        Widget::Toggle { id, value, .. } => {
+            out.insert(id.clone(), serde_json::Value::Bool(*value));
+        }
+        Widget::Choice { id, value, .. } => {
+            out.insert(id.clone(), serde_json::Value::String(value.clone()));
+        }
+        _ => {}
+    }
+    for child in w.children() {
+        collect_values(child, depth + 1, out);
+    }
+    // A pane's pinned footer is outside `children()`; an input in one is still on screen, so its
+    // declared value counts too.
+    if let Widget::Scroll { footer, .. } = w {
+        for child in footer {
+            collect_values(child, depth + 1, out);
+        }
+    }
 }
 
 /// Checks a whole tree: widget count, depth, ids, and the ranges the types cannot express. A bad
@@ -577,5 +620,25 @@ mod tests {
         let w = parse(json!({"type": "text", "id": "t", "value": long})).unwrap();
         assert!(check(&w).is_err());
         assert!(check(&parse(json!({"type": "text", "id": "t", "value": "hi"})).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn input_values_are_the_values_the_view_declares() {
+        let w = parse(json!({"type": "column", "children": [
+            {"type": "text", "id": "script", "value": "line one"},
+            {"type": "section", "title": "Style", "children": [
+                {"type": "number", "id": "size", "value": 12.5, "min": 1, "max": 100},
+                {"type": "toggle", "id": "bold", "value": true, "label": "Bold"},
+                {"type": "choice", "id": "font", "value": "Serif",
+                 "options": [{"value": "Serif", "label": "Serif"}]}]},
+            {"type": "button", "id": "go", "label": "Go"}]}))
+        .unwrap();
+        check(&w).unwrap();
+        let values = input_values(&w);
+        assert_eq!(values.get("script"), Some(&json!("line one")));
+        assert_eq!(values.get("size"), Some(&json!(12.5)));
+        assert_eq!(values.get("bold"), Some(&json!(true)));
+        assert_eq!(values.get("font"), Some(&json!("Serif")));
+        assert_eq!(values.get("go"), None, "a button has no value to report");
     }
 }
